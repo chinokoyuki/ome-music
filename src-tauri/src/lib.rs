@@ -2324,50 +2324,59 @@ async fn open_qqmusic_webview_login(app: tauri::AppHandle) -> Result<(), String>
 #[tauri::command]
 async fn extract_qqmusic_webview_cookie(app: tauri::AppHandle) -> Result<String, String> {
     // 方案0: 尝试使用 WebView2 CookieManager API 获取所有 cookies（包括 HttpOnly）
-    eprintln!("[QQMusic] 尝试 WebView2 CookieManager API...");
-    match get_webview2_all_cookies(&app).await {
-        Ok(cookie) => {
-            eprintln!("[QQMusic] WebView2 CookieManager 成功! cookie length={}, has qqmusic_key={}, has skey={}",
-                cookie.len(), cookie.contains("qqmusic_key"), cookie.contains("skey="));
-            if !cookie.is_empty() {
-                // 直接保存到 keyring，不依赖前端二次调用 importCookie
-                match save_qqmusic_token(&cookie) {
-                    Ok(()) => {
-                        eprintln!(
-                            "[QQMusic] ✅ Cookie已直接保存到keyring (WebView2), length={}",
-                            cookie.len()
-                        );
-                        // 验证保存是否成功
-                        match read_qqmusic_token() {
-                            Some(saved) => eprintln!(
-                                "[QQMusic] ✅ keyring读回验证成功, length={}",
-                                saved.len()
-                            ),
-                            None => eprintln!("[QQMusic] ❌ keyring读回失败! token未保存!"),
-                        }
-                        // 自动启用来源
-                        if let Some(state) = app.try_state::<AppState>() {
-                            if let Ok(db) = state.db.lock() {
-                                if let Err(e) = ensure_qqmusic_source_enabled(&db) {
-                                    eprintln!(
-                                        "[QQMusic] ⚠️ webview_extract: ensure_enabled failed: {}",
-                                        e
-                                    );
+    // Windows 专属 / Windows-only: WebView2 CookieManager is only available on Windows.
+    // On non-Windows, this returns Err and we fall through to the eval+title fallback below.
+    #[cfg(windows)]
+    {
+        eprintln!("[QQMusic] 尝试 WebView2 CookieManager API...");
+        match get_webview2_all_cookies(&app).await {
+            Ok(cookie) => {
+                eprintln!("[QQMusic] WebView2 CookieManager 成功! cookie length={}, has qqmusic_key={}, has skey={}",
+                    cookie.len(), cookie.contains("qqmusic_key"), cookie.contains("skey="));
+                if !cookie.is_empty() {
+                    // 直接保存到 keyring，不依赖前端二次调用 importCookie
+                    match save_qqmusic_token(&cookie) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[QQMusic] ✅ Cookie已直接保存到keyring (WebView2), length={}",
+                                cookie.len()
+                            );
+                            // 验证保存是否成功
+                            match read_qqmusic_token() {
+                                Some(saved) => eprintln!(
+                                    "[QQMusic] ✅ keyring读回验证成功, length={}",
+                                    saved.len()
+                                ),
+                                None => eprintln!("[QQMusic] ❌ keyring读回失败! token未保存!"),
+                            }
+                            // 自动启用来源
+                            if let Some(state) = app.try_state::<AppState>() {
+                                if let Ok(db) = state.db.lock() {
+                                    if let Err(e) = ensure_qqmusic_source_enabled(&db) {
+                                        eprintln!(
+                                            "[QQMusic] ⚠️ webview_extract: ensure_enabled failed: {}",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }
+                        Err(e) => eprintln!("[QQMusic] ❌ save_qqmusic_token失败: {}", e),
                     }
-                    Err(e) => eprintln!("[QQMusic] ❌ save_qqmusic_token失败: {}", e),
+                    return Ok(cookie);
                 }
-                return Ok(cookie);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[QQMusic] WebView2 CookieManager 失败: {}，回退到 eval+TCP beacon 方案",
+                    e
+                );
             }
         }
-        Err(e) => {
-            eprintln!(
-                "[QQMusic] WebView2 CookieManager 失败: {}，回退到 eval+TCP beacon 方案",
-                e
-            );
-        }
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("[QQMusic] WebView2 CookieManager 不可用（非 Windows），使用 eval+title 方案");
     }
 
     let window = app
