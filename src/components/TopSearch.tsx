@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
-import { ChevronDown, Loader2, RefreshCw, Search, Settings, X } from "lucide-react";
+import { ChevronDown, Loader2, Music2, RefreshCw, Search, Settings, X } from "lucide-react";
 import {
   BilibiliMusicProvider,
   ensureNeteaseApiService,
   getBilibiliSourceConfig,
   getNeteaseSourceConfig,
+  getQQMusicSourceConfig,
   NetEaseMusicProvider,
+  QQMusicProvider,
   waitForNeteaseServiceReady,
   type MusicSourceSong,
 } from "../features/musicSources/provider";
@@ -17,6 +19,7 @@ import { ArtworkImage } from "./ArtworkImage";
 
 const neteaseProvider = new NetEaseMusicProvider();
 const bilibiliProvider = new BilibiliMusicProvider();
+const qqmusicProvider = new QQMusicProvider();
 
 // Client-side page size: providers already return enough rows; keep the UI light.
 const SOURCE_PAGE_SIZE = 6;
@@ -25,6 +28,7 @@ interface TopSearchProps {
   onPlayLocal: (track: Track) => void;
   onPlayNetEase: (song: MusicSourceSong) => Promise<void | boolean>;
   onPlayBilibili: (song: MusicSourceSong) => Promise<void | boolean>;
+  onPlayQQMusic: (song: MusicSourceSong) => Promise<void | boolean>;
   onOpenSettings?: () => void;
 }
 
@@ -33,6 +37,7 @@ export function TopSearch({
   onPlayLocal,
   onPlayNetEase,
   onPlayBilibili,
+  onPlayQQMusic,
   onOpenSettings,
 }: TopSearchProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -48,9 +53,14 @@ export function TopSearch({
   const [isSearchingBilibili, setSearchingBilibili] = useState(false);
   const [neteaseMessage, setNeteaseMessage] = useState<string | null>(null);
   const [bilibiliMessage, setBilibiliMessage] = useState<string | null>(null);
+  const [qqmusicEnabled, setQQMusicEnabled] = useState(false);
+  const [qqmusicResults, setQQMusicResults] = useState<MusicSourceSong[]>([]);
+  const [isSearchingQQMusic, setSearchingQQMusic] = useState(false);
+  const [qqmusicMessage, setQQMusicMessage] = useState<string | null>(null);
   const [playingBilibiliId, setPlayingBilibiliId] = useState<string | null>(null);
   const [neteaseVisible, setNeteaseVisible] = useState(SOURCE_PAGE_SIZE);
   const [bilibiliVisible, setBilibiliVisible] = useState(SOURCE_PAGE_SIZE);
+  const [qqmusicVisible, setQQMusicVisible] = useState(SOURCE_PAGE_SIZE);
   // NetEase can still be warming up right after QR login or first launch.
   const [neteaseServiceStarting, setNeteaseServiceStarting] = useState(false);
   const [neteaseServiceError, setNeteaseServiceError] = useState<string | null>(null);
@@ -82,6 +92,13 @@ export function TopSearch({
       })
       .catch(() => {
         if (!cancelled) setBilibiliEnabled(false);
+      });
+    getQQMusicSourceConfig()
+      .then((config) => {
+        if (!cancelled) setQQMusicEnabled(config.enabled);
+      })
+      .catch(() => {
+        if (!cancelled) setQQMusicEnabled(false);
       });
     return () => {
       cancelled = true;
@@ -193,6 +210,43 @@ export function TopSearch({
     };
   }, [bilibiliEnabled, isOpen, query]);
 
+  // QQ 音乐搜索
+  useEffect(() => {
+    const term = query.trim();
+    setQQMusicMessage(null);
+
+    if (!isOpen || !qqmusicEnabled || term.length < 2) {
+      setQQMusicResults([]);
+      return;
+    }
+
+    setQQMusicVisible(SOURCE_PAGE_SIZE);
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setSearchingQQMusic(true);
+      qqmusicProvider
+        .searchSongs(term)
+        .then((songs) => {
+          if (!cancelled) setQQMusicResults(songs);
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setQQMusicResults([]);
+            setQQMusicMessage(readSourceError(error, "qqmusic"));
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setSearchingQQMusic(false);
+        });
+    }, 600);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [qqmusicEnabled, isOpen, query]);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false);
@@ -240,6 +294,9 @@ export function TopSearch({
             void getBilibiliSourceConfig()
               .then((config) => setBilibiliEnabled(config.enabled))
               .catch(() => setBilibiliEnabled(false));
+            void getQQMusicSourceConfig()
+              .then((config) => setQQMusicEnabled(config.enabled))
+              .catch(() => setQQMusicEnabled(false));
           }}
           onBlur={closeSoon}
           placeholder="Find a song for this moment..."
@@ -276,6 +333,7 @@ export function TopSearch({
                   <button
                     key={track.id}
                     type="button"
+                    aria-label={`Play ${track.title} by ${track.artist}`}
                     onMouseDown={(event) => event.preventDefault()}
                     onClick={() => {
                       onPlayLocal(track);
@@ -452,6 +510,63 @@ export function TopSearch({
               )}
             </SearchGroup>
           )}
+
+          {query.trim().length >= 2 && (
+            <SearchGroup title="QQ音乐">
+              {!qqmusicEnabled ? (
+                <SourceDisabledHint
+                  label="QQ音乐源未启用 / QQ Music source is off"
+                  onOpenSettings={onOpenSettings}
+                />
+              ) : isSearchingQQMusic ? (
+                <div className="flex items-center gap-2 px-2 py-3 text-xs font-semibold text-[#4a2108]/38">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Searching QQ音乐…
+                </div>
+              ) : qqmusicResults.length ? (
+                <>
+                  {qqmusicResults.slice(0, qqmusicVisible).map((song) => (
+                    <button
+                      key={song.id}
+                      type="button"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={async () => {
+                        await onPlayQQMusic(song);
+                        setOpen(false);
+                      }}
+                      className="search-result-row"
+                    >
+                      {song.coverUrl ? (
+                        <ArtworkImage
+                          src={song.coverUrl}
+                          alt={song.album}
+                          source="qqmusic"
+                          className="h-10 w-10 shrink-0 rounded-[10px] object-cover shadow-[0_10px_24px_rgba(74,33,8,0.18)]"
+                        />
+                      ) : (
+                        <div className="flex h-10 w-10 items-center justify-center rounded-[10px] bg-[#4a2108]/10 text-[#4a2108]/38">
+                          <Music2 className="h-4 w-4" />
+                        </div>
+                      )}
+                      <ResultText title={song.title} subtitle={`${song.artist} · ${song.album}`} />
+                      {song.unavailable && (
+                        <span className="ml-auto text-xs font-semibold text-[#4a2108]/30">
+                          unavailable
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                  {qqmusicResults.length > qqmusicVisible && (
+                    <ShowMoreButton
+                      onClick={() => setQQMusicVisible((v) => v + SOURCE_PAGE_SIZE)}
+                    />
+                  )}
+                </>
+              ) : (
+                <EmptyLine text={qqmusicMessage ?? "No QQ Music match yet."} />
+              )}
+            </SearchGroup>
+          )}
         </div>
       )}
     </div>
@@ -463,12 +578,16 @@ function compactNumber(value: number): string {
   return `${value}`;
 }
 
-function readSourceError(error: unknown): string {
+function readSourceError(error: unknown, source: "bilibili" | "qqmusic" = "bilibili"): string {
   const message = error instanceof Error ? error.message : String(error ?? "");
   if (message.includes("web verification") || message.includes("paused this search")) {
-    return "Bilibili needs a brief pause. Try this search again in a moment.";
+    return source === "bilibili"
+      ? "Bilibili needs a brief pause. Try this search again in a moment."
+      : "QQ音乐需要网页验证，请稍后再试 / QQ Music needs web verification, please try later.";
   }
-  return "Bilibili 搜索失败，请稍后再试 / Bilibili search failed, please try again.";
+  return source === "bilibili"
+    ? "Bilibili 搜索失败，请稍后再试 / Bilibili search failed, please try again."
+    : `QQ音乐搜索失败: ${message || "请稍后再试"} / QQ Music search failed.`;
 }
 
 function readNeteaseSearchError(error: unknown): string {

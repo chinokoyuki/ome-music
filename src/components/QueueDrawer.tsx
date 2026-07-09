@@ -13,6 +13,8 @@ function sourceTagLabel(source: Track["source"]): string {
       return "NetEase";
     case "bilibili":
       return "Bilibili";
+    case "qqmusic":
+      return "QQ音乐";
     case "local":
     default:
       return "Local";

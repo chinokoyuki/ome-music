@@ -37,7 +37,7 @@ export type LoopMode = "off" | "one" | "all" | "curator";
 //   shuffle    → loopMode="all",     shuffle=true
 export type PlaybackMode = "curator" | "loop" | "repeat-one" | "shuffle";
 
-export type MusicSource = "local" | "netease" | "bilibili";
+export type MusicSource = "local" | "netease" | "bilibili" | "qqmusic";
 
 export type MusicLanguage = "zh" | "en" | "jp" | "kr" | "instrumental" | "unknown";
 

@@ -21,6 +21,17 @@ use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use walkdir::WalkDir;
 
+pub mod qqmusic;
+use qqmusic::{
+    delete_qqmusic_token, ensure_qqmusic_source_enabled, fetch_qqmusic_liked_songs,
+    fetch_qqmusic_lyrics, fetch_qqmusic_playable_url, fetch_qqmusic_playlist,
+    fetch_qqmusic_song_metadata, fetch_qqmusic_user_playlists, fetch_qqmusic_user_profile,
+    fetch_qqmusic_vip_status, load_qqmusic_source_config, proxy_qqmusic_playback,
+    proxy_qqmusic_search_covers, proxy_qqmusic_track_covers, read_qqmusic_token,
+    resolve_qqmusic_source_config, save_qqmusic_source_config_to_db, save_qqmusic_token,
+    search_qqmusic, test_qqmusic_connection, QQMUSIC_DEFAULT_BASE_URL, QQMUSIC_UA,
+};
+
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a"];
 const INITIAL_SCHEMA: &str = include_str!("../migrations/001_initial_schema.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_mood_note_rename_and_indexes.sql");
@@ -871,6 +882,7 @@ fn list_tracks(state: State<'_, AppState>) -> Result<Vec<TrackDto>, String> {
     drop(db);
     proxy_bilibili_track_covers(&state, &mut tracks)?;
     proxy_netease_track_covers(&state, &mut tracks)?;
+    proxy_qqmusic_track_covers(&state, &mut tracks)?;
     Ok(tracks)
 }
 
@@ -1357,6 +1369,518 @@ fn clear_danmaku_cache(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+// ── QQ Music Tauri Commands ───────────────────────────────────────────
+
+#[tauri::command]
+fn get_qqmusic_source_config(
+    state: State<'_, AppState>,
+) -> Result<qqmusic::QQMusicSourceConfigDto, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    load_qqmusic_source_config(&db)
+}
+
+#[tauri::command]
+fn save_qqmusic_source_config(
+    state: State<'_, AppState>,
+    payload: qqmusic::SaveQQMusicSourceConfigPayload,
+) -> Result<qqmusic::QQMusicSourceConfigDto, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    save_qqmusic_source_config_to_db(&db, payload)?;
+    load_qqmusic_source_config(&db)
+}
+
+#[tauri::command]
+async fn test_qqmusic_source_connection(
+    _state: State<'_, AppState>,
+    payload: qqmusic::SaveQQMusicSourceConfigPayload,
+) -> Result<SourceConnectionDto, String> {
+    // 优先用 payload 中的 base_url 测试连接
+    if let Some(base_url) = payload.base_url.as_deref().filter(|v| !v.trim().is_empty()) {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(base_url)
+            .header("User-Agent", QQMUSIC_UA)
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+            .map_err(|e| format!("无法连接: {e}"))?;
+        return Ok(SourceConnectionDto {
+            ok: resp.status().is_success(),
+            message: if resp.status().is_success() {
+                "Connected. QQ音乐来源已就绪。".to_string()
+            } else {
+                format!("状态码 {}", resp.status().as_u16())
+            },
+        });
+    }
+    match test_qqmusic_connection().await {
+        Ok(msg) => Ok(SourceConnectionDto {
+            ok: true,
+            message: msg,
+        }),
+        Err(e) => Ok(SourceConnectionDto {
+            ok: false,
+            message: e,
+        }),
+    }
+}
+
+#[tauri::command]
+async fn import_qqmusic_token(
+    state: State<'_, AppState>,
+    payload: NeteaseCookiePayload,
+) -> Result<qqmusic::QQMusicLoginStatusDto, String> {
+    let cookie = payload.cookie.trim();
+    if cookie.is_empty() {
+        return Err("QQ音乐 Cookie 为空 / QQ Music cookie is empty.".to_string());
+    }
+    eprintln!(
+        "[QQMusic] import_token: cookie length={}, has qqmusic_key={}, has uin={}",
+        cookie.len(),
+        cookie.contains("qqmusic_key"),
+        cookie.contains("uin=")
+    );
+    save_qqmusic_token(cookie).map_err(|e| {
+        eprintln!("[QQMusic] ❌ import_token save failed: {}", e);
+        e
+    })?;
+    eprintln!("[QQMusic] ✅ import_token saved to keyring, verifying readback...");
+    match read_qqmusic_token() {
+        Some(saved) => eprintln!(
+            "[QQMusic] ✅ import_token readback OK, length={}",
+            saved.len()
+        ),
+        None => eprintln!("[QQMusic] ❌ import_token readback FAILED!"),
+    }
+
+    // 登录成功后自动启用来源，避免重开设置面板后丢失登录态
+    if let Ok(db) = state.db.lock() {
+        if let Err(e) = ensure_qqmusic_source_enabled(&db) {
+            eprintln!("[QQMusic] ⚠️ import_token: ensure_enabled failed: {}", e);
+        }
+    }
+
+    // 立即验证 Cookie 是否有效
+    let config = qqmusic::ResolvedQQMusicSourceConfig {
+        enabled: true,
+        base_url: QQMUSIC_DEFAULT_BASE_URL.to_string(),
+        token: Some(cookie.to_string()),
+    };
+    match qqmusic::verify_qqmusic_session(&config).await {
+        Ok((uin, nickname)) => Ok(qqmusic::QQMusicLoginStatusDto {
+            logged_in: true,
+            uin,
+            nickname,
+            avatar_url: String::new(),
+            vip_type: "none".to_string(),
+            message: "QQ音乐已连接 / QQ Music connected.".to_string(),
+        }),
+        Err(e) => {
+            // 验证失败但保留 token，让用户可以重试检测登录
+            // 安全网：即使 verify_session 失败，如果 cookie 中仍含有效凭据
+            // （有 qqmusic_key 且有 uin），仍认为已登录
+            let cookie_str = cookie;
+            let has_qqmusic_key = cookie_str.contains("qqmusic_key=")
+                || cookie_str.contains("p_skey=")
+                || cookie_str.contains("superkey=");
+            let has_uin = cookie_str.contains("uin=")
+                || cookie_str.contains("pt2gguin=")
+                || cookie_str.contains("superuin=");
+            eprintln!(
+                "[QQMusic] import_token: verify failed, safety net: has_key={}, has_uin={}",
+                has_qqmusic_key, has_uin
+            );
+            if has_qqmusic_key && has_uin {
+                let uin_str = qqmusic::resolve_qqmusic_uin(&config);
+                eprintln!(
+                    "[QQMusic] import_token: safety net PASSED, returning logged_in=true, uin={}",
+                    uin_str
+                );
+                Ok(qqmusic::QQMusicLoginStatusDto {
+                    logged_in: true,
+                    uin: uin_str,
+                    nickname: "QQ音乐用户".to_string(),
+                    avatar_url: String::new(),
+                    vip_type: "none".to_string(),
+                    message:
+                        "QQ音乐已连接（API验证跳过） / QQ Music connected (API verify skipped)."
+                            .to_string(),
+                })
+            } else {
+                eprintln!("[QQMusic] import_token: safety net FAILED, returning logged_in=false");
+                Ok(qqmusic::QQMusicLoginStatusDto {
+                    logged_in: false,
+                    uin: String::new(),
+                    nickname: String::new(),
+                    avatar_url: String::new(),
+                    vip_type: "none".to_string(),
+                    message: format!(
+                        "验证失败: {e} / Verification failed. Cookie saved, retry check login."
+                    ),
+                })
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn create_qqmusic_qr_login() -> Result<qqmusic::QQMusicQrLoginDto, String> {
+    qqmusic::create_qqmusic_qr().await
+}
+
+#[tauri::command]
+async fn check_qqmusic_qr_login(
+    state: State<'_, AppState>,
+    payload: QQMusicQrCheckPayload,
+) -> Result<qqmusic::QQMusicQrCheckDto, String> {
+    let result = qqmusic::check_qqmusic_qr(&payload.key, &payload.cookies).await?;
+    // 登录成功时保存 cookie 并自动启用来源
+    if result.status == "confirmed" {
+        if let Some(ref cookie) = result.cookie {
+            save_qqmusic_token(cookie)?;
+            // 确保来源在 DB 中标记为启用
+            if let Ok(db) = state.db.lock() {
+                if let Err(e) = ensure_qqmusic_source_enabled(&db) {
+                    eprintln!("[QQMusic] ⚠️ qr_login: ensure_enabled failed: {}", e);
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QQMusicQrCheckPayload {
+    key: String,
+    cookies: String,
+}
+
+#[tauri::command]
+async fn get_qqmusic_login_status(
+    _state: State<'_, AppState>,
+) -> Result<qqmusic::QQMusicLoginStatusDto, String> {
+    let token = read_qqmusic_token();
+    eprintln!(
+        "[QQMusic] login_status: token exists={}, length={}",
+        token.is_some(),
+        token.as_deref().map(|s| s.len()).unwrap_or(0)
+    );
+    if let Some(ref t) = token {
+        eprintln!(
+            "[QQMusic] login_status: contains qqmusic_key={}, contains uin={}, preview={}",
+            t.contains("qqmusic_key="),
+            t.contains("uin="),
+            &t[..t.len().min(200)]
+        );
+    }
+    let Some(ref cookie) = token else {
+        return Ok(qqmusic::QQMusicLoginStatusDto {
+            logged_in: false,
+            uin: String::new(),
+            nickname: String::new(),
+            avatar_url: String::new(),
+            vip_type: "none".to_string(),
+            message: "未登录 / Not signed in.".to_string(),
+        });
+    };
+
+    let config = qqmusic::ResolvedQQMusicSourceConfig {
+        enabled: true,
+        base_url: QQMUSIC_DEFAULT_BASE_URL.to_string(),
+        token: Some(cookie.clone()),
+    };
+    match qqmusic::verify_qqmusic_session(&config).await {
+        Ok((uin, nickname)) => Ok(qqmusic::QQMusicLoginStatusDto {
+            logged_in: true,
+            uin,
+            nickname,
+            avatar_url: String::new(),
+            vip_type: "none".to_string(),
+            message: "QQ音乐已连接 / QQ Music connected.".to_string(),
+        }),
+        Err(e) => {
+            // 验证失败但保留 token，让用户可以重试
+            // 安全网：即使 verify_session 失败，如果 cookie 中仍含有效凭据
+            // （uin > 0 且有 qqmusic_key），仍认为已登录
+            let cookie_str = cookie.as_str();
+            let has_qqmusic_key = cookie_str.contains("qqmusic_key=")
+                || cookie_str.contains("p_skey=")
+                || cookie_str.contains("superkey=");
+            // 检查 cookie 中是否有 uin 相关字段
+            let has_uin = cookie_str.contains("uin=")
+                || cookie_str.contains("pt2gguin=")
+                || cookie_str.contains("superuin=");
+            eprintln!("[QQMusic] login_status: verify failed, but checking cookie: has_key={has_qqmusic_key}, has_uin={has_uin}");
+            if has_qqmusic_key && has_uin {
+                // cookie 中有有效凭据，认为已登录（API 验证失败可能是格式问题）
+                let uin_str = qqmusic::resolve_qqmusic_uin(&config);
+                Ok(qqmusic::QQMusicLoginStatusDto {
+                    logged_in: true,
+                    uin: uin_str,
+                    nickname: "QQ音乐用户".to_string(),
+                    avatar_url: String::new(),
+                    vip_type: "none".to_string(),
+                    message:
+                        "QQ音乐已连接（API验证跳过） / QQ Music connected (API verify skipped)."
+                            .to_string(),
+                })
+            } else {
+                Ok(qqmusic::QQMusicLoginStatusDto {
+                    logged_in: false,
+                    uin: String::new(),
+                    nickname: String::new(),
+                    avatar_url: String::new(),
+                    vip_type: "none".to_string(),
+                    message: format!("验证失败: {e} / Verification failed. Token retained."),
+                })
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn logout_qqmusic() -> Result<qqmusic::QQMusicLoginStatusDto, String> {
+    delete_qqmusic_token()?;
+    Ok(qqmusic::QQMusicLoginStatusDto {
+        logged_in: false,
+        uin: String::new(),
+        nickname: String::new(),
+        avatar_url: String::new(),
+        vip_type: "none".to_string(),
+        message: "已登出 / Signed out.".to_string(),
+    })
+}
+
+#[tauri::command]
+async fn search_qqmusic_songs(
+    state: State<'_, AppState>,
+    payload: qqmusic::QQMusicSearchPayload,
+) -> Result<Vec<SourceSongDto>, String> {
+    let query = payload.query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        resolve_qqmusic_source_config(&db)?
+    };
+    let page = payload.page.unwrap_or(1);
+    let page_size = payload.page_size.unwrap_or(20);
+    let mut songs = search_qqmusic(&config, query, page, page_size).await?;
+    proxy_qqmusic_search_covers(state.inner(), &mut songs)?;
+    Ok(songs)
+}
+
+#[tauri::command]
+async fn get_qqmusic_song_metadata(
+    state: State<'_, AppState>,
+    payload: qqmusic::QQMusicSourceSongPayload,
+) -> Result<SourceSongDto, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        resolve_qqmusic_source_config(&db)?
+    };
+    let mut song = fetch_qqmusic_song_metadata(&config, &payload.song_id).await?;
+    if is_proxyable_remote_url(&song.cover_url) {
+        song.cover_url = register_media_proxy(state.inner(), &song.cover_url, "image")?;
+    }
+    Ok(song)
+}
+
+#[tauri::command]
+async fn get_qqmusic_playable_url(
+    state: State<'_, AppState>,
+    payload: qqmusic::QQMusicPlayablePayload,
+) -> Result<PlayableUrlDto, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        resolve_qqmusic_source_config(&db)?
+    };
+    let mut playback =
+        fetch_qqmusic_playable_url(&config, &payload.song_id, payload.quality.as_deref()).await?;
+    proxy_qqmusic_playback(state.inner(), &mut playback)?;
+    Ok(playback)
+}
+
+#[tauri::command]
+async fn import_qqmusic_song(
+    state: State<'_, AppState>,
+    payload: qqmusic::QQMusicSourceSongPayload,
+) -> Result<Vec<TrackDto>, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        resolve_qqmusic_source_config(&db)?
+    };
+
+    let mut song = fetch_qqmusic_song_metadata(&config, &payload.song_id).await?;
+    // 尝试获取播放链接但不阻塞导入
+    let _playback = fetch_qqmusic_playable_url(&config, &payload.song_id, Some("standard"))
+        .await
+        .ok();
+    if let Some(ref pb) = _playback {
+        if let Some(ref url) = pb.url {
+            song.playable_url = Some(url.clone());
+        }
+        song.unavailable = pb.unavailable;
+        song.unavailable_reason = pb.reason.clone();
+    }
+
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let track = parsed_track_from_source_song(&song);
+    upsert_track(&db, &track)?;
+    let mut tracks = load_tracks(&db)?;
+    drop(db);
+    proxy_qqmusic_track_covers(state.inner(), &mut tracks)?;
+    proxy_bilibili_track_covers(&state, &mut tracks)?;
+    proxy_netease_track_covers(&state, &mut tracks)?;
+    Ok(tracks)
+}
+
+#[tauri::command]
+async fn get_qqmusic_lyrics(
+    state: State<'_, AppState>,
+    payload: qqmusic::QQMusicSourceSongPayload,
+) -> Result<SourceLyricsDto, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        resolve_qqmusic_source_config(&db)?
+    };
+    let (lyrics, trans) = fetch_qqmusic_lyrics(&config, &payload.song_id).await?;
+    Ok(SourceLyricsDto {
+        song_id: payload.song_id.clone(),
+        lyrics,
+        translated_lyrics: trans,
+        source: "qqmusic".to_string(),
+        cache_key: format!("qqmusic:{}:lrc", payload.song_id),
+    })
+}
+
+// ── QQ Music Playlist / VIP / UserProfile Commands ───────────────────
+
+#[tauri::command]
+async fn get_qqmusic_user_playlists(
+    state: State<'_, AppState>,
+) -> Result<Vec<qqmusic::QQMusicUserPlaylistDto>, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        resolve_qqmusic_source_config(&db)?
+    };
+    let mut playlists = fetch_qqmusic_user_playlists(&config).await?;
+    // Proxy cover URLs
+    for p in playlists.iter_mut() {
+        if is_proxyable_remote_url(&p.cover_url) {
+            p.cover_url = register_media_proxy(state.inner(), &p.cover_url, "image")?;
+        }
+    }
+    Ok(playlists)
+}
+
+#[tauri::command]
+async fn get_qqmusic_playlist(
+    state: State<'_, AppState>,
+    payload: SourcePlaylistPayload,
+) -> Result<SourcePlaylistDto, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        resolve_qqmusic_source_config(&db)?
+    };
+    let mut playlist = fetch_qqmusic_playlist(&config, &payload.playlist_id).await?;
+    proxy_qqmusic_search_covers(state.inner(), &mut playlist.tracks)?;
+    Ok(playlist)
+}
+
+#[tauri::command]
+async fn import_qqmusic_playlist(
+    state: State<'_, AppState>,
+    payload: SourcePlaylistPayload,
+) -> Result<SourcePlaylistDto, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        resolve_qqmusic_source_config(&db)?
+    };
+    let mut playlist = fetch_qqmusic_playlist(&config, &payload.playlist_id).await?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    import_source_playlist_to_db(&db, &playlist)?;
+    drop(db);
+    proxy_qqmusic_search_covers(state.inner(), &mut playlist.tracks)?;
+    Ok(playlist)
+}
+
+#[tauri::command]
+async fn get_qqmusic_liked_songs(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> Result<Vec<SourceSongDto>, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        resolve_qqmusic_source_config(&db)?
+    };
+    let mut songs = fetch_qqmusic_liked_songs(&config, limit.unwrap_or(100)).await?;
+    proxy_qqmusic_search_covers(state.inner(), &mut songs)?;
+    Ok(songs)
+}
+
+#[tauri::command]
+fn qqmusic_debug_dump(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    Ok(qqmusic::debug_dump_qqmusic(&db))
+}
+
+#[tauri::command]
+async fn get_qqmusic_vip_status(
+    _state: State<'_, AppState>,
+) -> Result<qqmusic::QQMusicVipStatusDto, String> {
+    // VIP 状态查询属于账号信息查询，与 get_qqmusic_login_status 同源：
+    // 直接读取 keyring 中的 cookie 即可，不应依赖 source 是否启用。
+    // 否则会出现"已登录但 VIP 状态未知"的不一致状态。
+    let token = read_qqmusic_token();
+    let Some(ref cookie) = token else {
+        return Ok(qqmusic::QQMusicVipStatusDto {
+            is_member: false,
+            level: None,
+            message: "未登录 / Not signed in.".to_string(),
+            membership_known: false,
+        });
+    };
+    let config = qqmusic::ResolvedQQMusicSourceConfig {
+        enabled: true,
+        base_url: QQMUSIC_DEFAULT_BASE_URL.to_string(),
+        token: Some(cookie.clone()),
+    };
+    fetch_qqmusic_vip_status(&config).await
+}
+
+#[tauri::command]
+async fn get_qqmusic_user_profile(
+    state: State<'_, AppState>,
+) -> Result<qqmusic::QQMusicUserProfileDto, String> {
+    // 同 get_qqmusic_vip_status：账号资料查询不依赖 source 启用状态。
+    let token = read_qqmusic_token();
+    let Some(ref cookie) = token else {
+        return Ok(qqmusic::QQMusicUserProfileDto {
+            logged_in: false,
+            nickname: None,
+            user_id: None,
+            avatar_url: None,
+            vip: None,
+        });
+    };
+    let config = qqmusic::ResolvedQQMusicSourceConfig {
+        enabled: true,
+        base_url: QQMUSIC_DEFAULT_BASE_URL.to_string(),
+        token: Some(cookie.clone()),
+    };
+    let mut profile = fetch_qqmusic_user_profile(&config).await?;
+    // Proxy avatar URL
+    if let Some(ref avatar) = profile.avatar_url {
+        if is_proxyable_remote_url(avatar) {
+            profile.avatar_url = Some(register_media_proxy(state.inner(), avatar, "image")?);
+        }
+    }
+    Ok(profile)
+}
+
 #[tauri::command]
 async fn ensure_netease_api_service(
     state: State<'_, AppState>,
@@ -1626,6 +2150,7 @@ fn open_source_web_login(payload: SourceWebLoginPayload) -> Result<SourceConnect
     let url = match source.as_str() {
         "netease" => "https://music.163.com/#/login",
         "bilibili" => "https://passport.bilibili.com/login",
+        "qqmusic" => "https://y.qq.com/",
         _ => return Err("This music source does not support secure web login yet.".to_string()),
     };
     open_url_with_system(url)?;
@@ -1634,6 +2159,503 @@ fn open_source_web_login(payload: SourceWebLoginPayload) -> Result<SourceConnect
         message: "Secure login page opened. Complete it there, then import Cookie if needed."
             .to_string(),
     })
+}
+
+/// 打开 QQ 音乐 webview 登录窗口
+#[cfg(windows)]
+async fn get_webview2_all_cookies(app: &tauri::AppHandle) -> Result<String, String> {
+    use webview2_com::{
+        take_pwstr, GetCookiesCompletedHandler,
+        Microsoft::Web::WebView2::Win32::{ICoreWebView2Cookie, ICoreWebView2_2},
+    };
+    use windows::core::{Interface, HSTRING, PWSTR};
+
+    let window = app
+        .get_webview_window("qqmusic-login")
+        .ok_or_else(|| "qqmusic-login window not found".to_string())?;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let tx = std::sync::Mutex::new(Some(tx));
+
+    window.with_webview(move |webview| {
+        unsafe {
+            let controller = webview.controller();
+
+            // 获取 ICoreWebView2
+            let core = match controller.CoreWebView2() {
+                Ok(c) => c,
+                Err(e) => {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(Err(format!("CoreWebView2 failed: {}", e)));
+                    }
+                    return;
+                }
+            };
+
+            // 转换为 ICoreWebView2_2 以访问 CookieManager
+            let core2 = match Interface::cast::<ICoreWebView2_2>(&core) {
+                Ok(c) => c,
+                Err(e) => {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(Err(format!("cast ICoreWebView2_2 failed: {}", e)));
+                    }
+                    return;
+                }
+            };
+
+            // 获取 CookieManager
+            let manager = match core2.CookieManager() {
+                Ok(m) => m,
+                Err(e) => {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(Err(format!("CookieManager failed: {}", e)));
+                    }
+                    return;
+                }
+            };
+
+            eprintln!("[QQMusic] WebView2 CookieManager obtained, getting cookies for https://y.qq.com/");
+
+            let uri = HSTRING::from("https://y.qq.com/");
+            let tx_inner = std::sync::Arc::new(tx);
+
+            let tx_for_callback = tx_inner.clone();
+            let result = GetCookiesCompletedHandler::wait_for_async_operation(
+                Box::new(move |handler| {
+                    manager.GetCookies(&uri, &handler)?;
+                    Ok(())
+                }),
+                Box::new(move |hresult, list| {
+                    hresult?;
+                    match list {
+                        Some(list) => {
+                            let mut count: u32 = 0;
+                            list.Count(&mut count)?;
+                            eprintln!("[QQMusic] WebView2 CookieManager: {} cookies found", count);
+                            let mut cookies = vec![];
+                            for i in 0..count {
+                                let cookie: ICoreWebView2Cookie = list.GetValueAtIndex(i)?;
+                                let mut name = PWSTR::null();
+                                let mut value = PWSTR::null();
+                                let mut domain = PWSTR::null();
+                                cookie.Name(&mut name)?;
+                                cookie.Value(&mut value)?;
+                                cookie.Domain(&mut domain)?;
+                                let n = take_pwstr(name);
+                                let v = take_pwstr(value);
+                                let d = take_pwstr(domain);
+                                eprintln!("[QQMusic]   cookie[{}]: {}={} (domain={})", i, n, &v[..v.len().min(30)], d);
+                                cookies.push(format!("{}={}", n, v));
+                            }
+                            let cookie_str = cookies.join("; ");
+                            eprintln!("[QQMusic] WebView2 cookie string length: {}", cookie_str.len());
+                            if let Some(tx) = tx_for_callback.lock().unwrap().take() {
+                                let _ = tx.send(Ok(cookie_str));
+                            }
+                        }
+                        None => {
+                            eprintln!("[QQMusic] WebView2 CookieManager returned no cookies");
+                            if let Some(tx) = tx_for_callback.lock().unwrap().take() {
+                                let _ = tx.send(Err("No cookies returned".to_string()));
+                            }
+                        }
+                    }
+                    Ok(())
+                }),
+            );
+
+            if let Err(e) = result {
+                eprintln!("[QQMusic] WebView2 wait_for_async_operation error: {}", e);
+                if let Some(tx) = tx_inner.lock().unwrap().take() {
+                    let _ = tx.send(Err(format!("wait_for_async_operation failed: {}", e)));
+                }
+            }
+        }
+    }).map_err(|e| format!("with_webview failed: {}", e))?;
+
+    rx.await
+        .map_err(|e| format!("channel recv failed: {}", e))?
+}
+
+/// 用户在窗口中登录后，点击"提取Cookie"按钮获取 cookie
+/// 使用 initialization_script 在页面加载前注入 JS，绕过 CSP 限制
+#[tauri::command]
+async fn open_qqmusic_webview_login(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::WebviewWindowBuilder;
+
+    // 如果窗口已存在，聚焦它
+    if let Some(window) = app.get_webview_window("qqmusic-login") {
+        window
+            .set_focus()
+            .map_err(|e| format!("Failed to focus window: {}", e))?;
+        return Ok(());
+    }
+
+    // initialization_script 在页面 JS 加载前由 WebView2 引擎注入，不受页面 CSP 限制
+    // 用 setInterval 每 100ms 持续将 document.cookie 写入 title，防止 SPA 覆盖
+    let init_script = r#"(function() {
+        if (window.__qqCookieInterval) clearInterval(window.__qqCookieInterval);
+        window.__qqCookieInterval = setInterval(function() {
+            try {
+                var c = document.cookie || '';
+                document.title = 'QQMUSIC_COOKIE_START' + c + 'QQMUSIC_COOKIE_END';
+            } catch(e) {
+                document.title = 'QQMUSIC_COOKIE_ERROR:' + e.message;
+            }
+        }, 200);
+    })()"#;
+
+    let _window = WebviewWindowBuilder::new(
+        &app,
+        "qqmusic-login",
+        tauri::WebviewUrl::External("https://y.qq.com/".parse().unwrap()),
+    )
+    .title("QQ音乐登录 - 登录后点击下方'提取Cookie'按钮")
+    .inner_size(1000.0, 700.0)
+    .initialization_script(init_script)
+    .build()
+    .map_err(|e| format!("Failed to create window: {}", e))?;
+
+    Ok(())
+}
+
+/// 从 QQ 音乐 webview 窗口提取 cookie
+/// 综合方案：eval() 读取 document.cookie + localStorage + fetch API 验证
+#[tauri::command]
+async fn extract_qqmusic_webview_cookie(app: tauri::AppHandle) -> Result<String, String> {
+    // 方案0: 尝试使用 WebView2 CookieManager API 获取所有 cookies（包括 HttpOnly）
+    eprintln!("[QQMusic] 尝试 WebView2 CookieManager API...");
+    match get_webview2_all_cookies(&app).await {
+        Ok(cookie) => {
+            eprintln!("[QQMusic] WebView2 CookieManager 成功! cookie length={}, has qqmusic_key={}, has skey={}",
+                cookie.len(), cookie.contains("qqmusic_key"), cookie.contains("skey="));
+            if !cookie.is_empty() {
+                // 直接保存到 keyring，不依赖前端二次调用 importCookie
+                match save_qqmusic_token(&cookie) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[QQMusic] ✅ Cookie已直接保存到keyring (WebView2), length={}",
+                            cookie.len()
+                        );
+                        // 验证保存是否成功
+                        match read_qqmusic_token() {
+                            Some(saved) => eprintln!(
+                                "[QQMusic] ✅ keyring读回验证成功, length={}",
+                                saved.len()
+                            ),
+                            None => eprintln!("[QQMusic] ❌ keyring读回失败! token未保存!"),
+                        }
+                        // 自动启用来源
+                        if let Some(state) = app.try_state::<AppState>() {
+                            if let Ok(db) = state.db.lock() {
+                                if let Err(e) = ensure_qqmusic_source_enabled(&db) {
+                                    eprintln!(
+                                        "[QQMusic] ⚠️ webview_extract: ensure_enabled failed: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("[QQMusic] ❌ save_qqmusic_token失败: {}", e),
+                }
+                return Ok(cookie);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[QQMusic] WebView2 CookieManager 失败: {}，回退到 eval+TCP beacon 方案",
+                e
+            );
+        }
+    }
+
+    let window = app
+        .get_webview_window("qqmusic-login")
+        .ok_or("QQ音乐登录窗口未打开，请先点击'打开QQ音乐登录页'按钮")?;
+
+    let current_url = window.url().map(|u| u.to_string()).unwrap_or_default();
+    eprintln!("[QQMusic] webview extract: current URL = {}", current_url);
+
+    // ── 综合提取：document.cookie + localStorage + fetch API 验证 ──
+    // 用 eval() 执行 JS，结果写入 document.title，然后通过 window.title() 读取
+    // JS 同时启动 fetch() 异步验证，第二次读取 title 时获取 fetch 结果
+    let js_extract = r#"try {
+        var cookie = document.cookie || '';
+        var lsData = {};
+        try {
+            for (var i = 0; i < localStorage.length; i++) {
+                var key = localStorage.key(i);
+                if (key) {
+                    var lk = key.toLowerCase();
+                    if (lk.indexOf('qqmusic') >= 0 || lk.indexOf('qm_keyst') >= 0 || lk.indexOf('music_key') >= 0 || lk.indexOf('uin') >= 0) {
+                        lsData[key] = localStorage.getItem(key);
+                    }
+                }
+            }
+        } catch(e) {}
+        var info = JSON.stringify({cookie: cookie, localStorage: lsData, url: window.location.href, hasQQMusicKey: cookie.indexOf('qqmusic_key') >= 0});
+        document.title = 'QQMUSIC_EXTRACT_START' + info + 'QQMUSIC_EXTRACT_END';
+    } catch(e) {
+        document.title = 'QQMUSIC_COOKIE_ERROR:' + e.message;
+    }"#;
+
+    for attempt in 1..=5u32 {
+        if let Err(e) = window.eval(js_extract) {
+            eprintln!("[QQMusic] eval attempt {} failed: {}", attempt, e);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let title = window
+            .title()
+            .map_err(|e| format!("Failed to get title: {}", e))?;
+        eprintln!(
+            "[QQMusic] eval attempt {}: title length={}, preview={}",
+            attempt,
+            title.len(),
+            &title[..title.len().min(300)]
+        );
+
+        if let Some(stripped) = title.strip_prefix("QQMUSIC_COOKIE_ERROR:") {
+            return Err(format!("JavaScript 错误: {}", stripped));
+        }
+
+        if let Some(start) = title.find("QQMUSIC_EXTRACT_START") {
+            if let Some(end) = title.find("QQMUSIC_EXTRACT_END") {
+                let json_str = &title[start + "QQMUSIC_EXTRACT_START".len()..end];
+                eprintln!("[QQMusic] extract JSON length={}", json_str.len());
+
+                // 解析 JSON
+                if let Ok(info) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    let cookie = info["cookie"].as_str().unwrap_or("");
+                    let has_qqmusic_key = info["hasQQMusicKey"].as_bool().unwrap_or(false);
+                    let url = info["url"].as_str().unwrap_or("");
+                    let ls = &info["localStorage"];
+
+                    eprintln!(
+                        "[QQMusic] extract: URL={}, cookie length={}, has qqmusic_key={}",
+                        url,
+                        cookie.len(),
+                        has_qqmusic_key
+                    );
+                    eprintln!(
+                        "[QQMusic] extract: cookie (前300)={}",
+                        &cookie[..cookie.len().min(300)]
+                    );
+                    eprintln!(
+                        "[QQMusic] extract: localStorage keys={}",
+                        ls.as_object()
+                            .map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(", "))
+                            .unwrap_or_default()
+                    );
+
+                    if !cookie.is_empty() && has_qqmusic_key {
+                        eprintln!("[QQMusic] extract: SUCCESS - cookie contains qqmusic_key");
+                        match save_qqmusic_token(cookie) {
+                            Ok(()) => eprintln!(
+                                "[QQMusic] ✅ Cookie已保存到keyring (eval+title), length={}",
+                                cookie.len()
+                            ),
+                            Err(e) => eprintln!("[QQMusic] ❌ save_qqmusic_token失败: {}", e),
+                        }
+                        return Ok(cookie.to_string());
+                    }
+                    if !cookie.is_empty() && attempt >= 3 {
+                        // 即使没有 qqmusic_key，也返回 cookie（可能 qqmusic_key 在其他位置）
+                        eprintln!(
+                            "[QQMusic] extract: returning cookie without qqmusic_key (attempt {})",
+                            attempt
+                        );
+                        match save_qqmusic_token(cookie) {
+                            Ok(()) => eprintln!(
+                                "[QQMusic] ✅ Cookie已保存到keyring (eval fallback), length={}",
+                                cookie.len()
+                            ),
+                            Err(e) => eprintln!("[QQMusic] ❌ save_qqmusic_token失败: {}", e),
+                        }
+                        return Ok(cookie.to_string());
+                    }
+                } else {
+                    eprintln!(
+                        "[QQMusic] extract: JSON parse failed, raw (前300)={}",
+                        &json_str[..json_str.len().min(300)]
+                    );
+                }
+            }
+        }
+
+        // 也检查旧格式
+        if let Some(start) = title.find("QQMUSIC_COOKIE_START") {
+            if let Some(end) = title.find("QQMUSIC_COOKIE_END") {
+                let cookie = &title[start + "QQMUSIC_COOKIE_START".len()..end];
+                eprintln!(
+                    "[QQMusic] old-format cookie: length={}, has qqmusic_key={}",
+                    cookie.len(),
+                    cookie.contains("qqmusic_key")
+                );
+                if !cookie.is_empty() && cookie.contains("qqmusic_key") {
+                    match save_qqmusic_token(cookie) {
+                        Ok(()) => eprintln!(
+                            "[QQMusic] ✅ Cookie已保存到keyring (old format), length={}",
+                            cookie.len()
+                        ),
+                        Err(e) => eprintln!("[QQMusic] ❌ save_qqmusic_token失败: {}", e),
+                    }
+                    return Ok(cookie.to_string());
+                }
+            }
+        }
+    }
+
+    eprintln!("[QQMusic] method1 (eval+title) failed, trying method2 (TCP beacon)");
+
+    // ── 方案2: 本地 TCP 服务器 + Image beacon ──
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("Failed to bind TCP listener: {}", e))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to get local addr: {}", e))?
+        .port();
+    eprintln!(
+        "[QQMusic] TCP beacon server listening on 127.0.0.1:{}",
+        port
+    );
+
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("Failed to set non-blocking: {}", e))?;
+
+    // 用 eval() 执行 JS：通过 Image beacon 发送 document.cookie
+    // Image 加载不受 CORS 限制，可以跨域发送请求
+    // 用 eval() 执行 JS：通过 Image beacon 发送 document.cookie
+    // 使用 localhost 而非 127.0.0.1：Chromium 将 http://localhost 视为可信源，豁免混合内容阻止
+    // Image 加载不受 CORS 限制，可以跨域发送请求
+    let js_beacon = format!(
+        r#"try {{
+            var c = document.cookie || '';
+            var img = new Image();
+            img.src = 'http://localhost:{}/?cookie=' + encodeURIComponent(c);
+        }} catch(e) {{
+            var img2 = new Image();
+            img2.src = 'http://localhost:{}/?error=' + encodeURIComponent(e.message);
+        }}"#,
+        port, port
+    );
+
+    window
+        .eval(&js_beacon)
+        .map_err(|e| format!("eval beacon failed: {}", e))?;
+
+    // 等待 TCP 连接（最多 5 秒）
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!("[QQMusic] method2 timed out waiting for beacon");
+            break;
+        }
+
+        match listener.accept() {
+            Ok((mut stream, addr)) => {
+                eprintln!("[QQMusic] TCP beacon received from {}", addr);
+                use std::io::Read;
+                let mut buf = [0u8; 8192];
+                stream.set_nonblocking(false).ok();
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                eprintln!(
+                    "[QQMusic] TCP request: {}",
+                    &request[..request.len().min(500)]
+                );
+
+                if let Some(pos) = request.find("/?cookie=") {
+                    let rest = &request[pos + "/?cookie=".len()..];
+                    let encoded: String = rest
+                        .chars()
+                        .take_while(|&c| c != ' ' && c != '\n' && c != '\r')
+                        .collect();
+                    let cookie = urlencoding_decode(&encoded);
+                    eprintln!(
+                        "[QQMusic] method2 cookie: length={}, has qqmusic_key={}",
+                        cookie.len(),
+                        cookie.contains("qqmusic_key")
+                    );
+                    if !cookie.is_empty() {
+                        let response = "HTTP/1.1 200 OK
+
+Content-Length: 2
+
+
+
+OK";
+                        use std::io::Write;
+                        stream.write_all(response.as_bytes()).ok();
+                        // 直接保存到 keyring
+                        match save_qqmusic_token(&cookie) {
+                            Ok(()) => eprintln!(
+                                "[QQMusic] ✅ Cookie已保存到keyring (TCP beacon), length={}",
+                                cookie.len()
+                            ),
+                            Err(e) => eprintln!("[QQMusic] ❌ save_qqmusic_token失败: {}", e),
+                        }
+                        return Ok(cookie);
+                    }
+                }
+                if let Some(pos) = request.find("/?error=") {
+                    let rest = &request[pos + "/?error=".len()..];
+                    let encoded: String = rest
+                        .chars()
+                        .take_while(|&c| c != ' ' && c != '\n' && c != '\r')
+                        .collect();
+                    let err_msg = urlencoding_decode(&encoded);
+                    eprintln!("[QQMusic] beacon JS error: {}", err_msg);
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                eprintln!("[QQMusic] TCP accept error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Err("未能从窗口提取 Cookie。可能原因：1) 页面尚未加载完成；2) Cookie 为 HttpOnly 类型，JS 无法读取；3) 页面 CSP 阻止了请求。请确保已在窗口中登录QQ音乐后再点提取".to_string())
+}
+
+/// URL 解码辅助函数
+fn urlencoding_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let h = chars.next();
+            let l = chars.next();
+            if let (Some(h), Some(l)) = (h, l) {
+                if let (Some(hv), Some(lv)) = (h.to_digit(16), l.to_digit(16)) {
+                    result.push((hv * 16 + lv) as u8 as char);
+                    continue;
+                }
+            }
+            result.push(c);
+        } else if c == '+' {
+            result.push(' ');
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// 关闭 QQ 音乐 webview 登录窗口
+#[tauri::command]
+async fn close_qqmusic_webview_login(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("qqmusic-login") {
+        window
+            .close()
+            .map_err(|e| format!("Failed to close window: {}", e))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2096,6 +3118,38 @@ async fn resolve_track_lyrics(
             confidence: 0.0,
             warning: Some("No matched lyrics for this version.".to_string()),
             offset_ms: 0,
+        }
+    } else if source == "qqmusic" {
+        let config = {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            resolve_qqmusic_source_config(&db)?
+        };
+        match fetch_qqmusic_lyrics(&config, &source_id).await {
+            Ok((lyrics, translated_lyrics)) => {
+                let warning = if lyrics.trim().is_empty() {
+                    Some("No matched lyrics for this version.".to_string())
+                } else {
+                    None
+                };
+                ResolvedLyricsDto {
+                    cache_key,
+                    source,
+                    lyrics,
+                    translated_lyrics,
+                    confidence: if warning.is_some() { 0.0 } else { 0.9 },
+                    warning,
+                    offset_ms: 0,
+                }
+            }
+            Err(e) => ResolvedLyricsDto {
+                cache_key,
+                source,
+                lyrics: String::new(),
+                translated_lyrics: String::new(),
+                confidence: 0.0,
+                warning: Some(e),
+                offset_ms: 0,
+            },
         }
     } else {
         resolve_local_track_lyrics(track, source, source_id, cache_key)?
@@ -5057,8 +6111,23 @@ fn normalize_netease_image_url(value: String) -> String {
     }
 }
 
-// Whether a cover URL should be routed through the ome-media:// proxy.
-//
+// 安全截取字符串预览，避免 UTF-8 字符边界 panic
+// Safe string preview that avoids UTF-8 char boundary panics
+fn safe_str_preview(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let mut end = n;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn safe_url_preview(url: &str, n: usize) -> &str {
+    safe_str_preview(url, n)
+}
+
 // Only remote http(s) URLs need proxying. Local/inline covers (data:, blob:,
 // file:), already-proxied ome-media:// URLs, and the SVG fallback cover
 // produced by `fallback_cover_url` must be passed through untouched so the
@@ -5285,6 +6354,10 @@ async fn respond_bilibili_media(
             || lower_url.contains("bilivideo")
             || lower_url.contains("hdslb.com")
             || lower_url.contains("akamaized.net");
+        // QQ 音乐 CDN (aqqmusic.tc.qq.com, ws.stream.qqmusic.qq.com) 需要 Referer
+        let is_qqmusic_host = lower_url.contains("qq.com")
+            || lower_url.contains("tc.qq.com")
+            || lower_url.contains("stream.qqmusic");
         let mut remote = client
             .get(url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36");
@@ -5293,14 +6366,39 @@ async fn respond_bilibili_media(
                 .header("Referer", "https://www.bilibili.com/")
                 .header("Origin", "https://www.bilibili.com");
         }
+        if is_qqmusic_host {
+            remote = remote
+                .header("Referer", "https://y.qq.com/")
+                .header("Origin", "https://y.qq.com")
+                .header("Accept", "*/*")
+                .header("Accept-Encoding", "identity")
+                .header("Cache-Control", "no-cache");
+        }
         if let Some(range) = requested_range.as_deref() {
             remote = remote.header(reqwest::header::RANGE, range);
         }
         if let Ok(candidate) = remote.send().await {
-            if candidate.status().is_success() {
+            let status = candidate.status();
+            let url_preview = safe_url_preview(url, 100);
+            eprintln!(
+                "[MediaProxy] {} status={} (url_len={})",
+                url_preview,
+                status,
+                url.len()
+            );
+            if status.is_success() {
                 response = Some(candidate);
                 break;
             }
+            // 非 2xx：打印响应体帮助诊断
+            if !status.is_success() {
+                if let Ok(body) = candidate.text().await {
+                    let body_preview = safe_str_preview(&body, 200);
+                    eprintln!("[MediaProxy] error body: {}", body_preview);
+                }
+            }
+        } else {
+            eprintln!("[MediaProxy] {} request failed", safe_url_preview(url, 100));
         }
     }
     let Some(response) = response else {
@@ -8499,15 +9597,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
-                // Kill the managed node.exe runtime so it does not orphan when the
-                // app exits and block the NSIS installer from overwriting it.
-                let app_handle = window.app_handle();
-                let state = app_handle.state::<AppState>();
-                if let Ok(mut guard) = state.managed_netease_child.lock() {
-                    if let Some(mut child) = guard.take() {
-                        let _ = child.kill();
-                    }
-                };
+                // Only clean up the managed node.exe runtime when the MAIN window
+                // is closed — not when auxiliary windows (e.g. qqmusic-login)
+                // are closed. Closing those should NOT kill the netease API
+                // service or cause the app to exit.
+                let label = window.label().to_string();
+                if label == "main" {
+                    let app_handle = window.app_handle();
+                    let state = app_handle.state::<AppState>();
+                    if let Ok(mut guard) = state.managed_netease_child.lock() {
+                        if let Some(mut child) = guard.take() {
+                            let _ = child.kill();
+                        }
+                    };
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -8576,7 +9679,30 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             transcribe_speech_audio,
             synthesize_curator_speech,
             save_playlist_analysis_result,
-            get_latest_playlist_analysis
+            get_latest_playlist_analysis,
+            get_qqmusic_source_config,
+            save_qqmusic_source_config,
+            test_qqmusic_source_connection,
+            import_qqmusic_token,
+            create_qqmusic_qr_login,
+            check_qqmusic_qr_login,
+            get_qqmusic_login_status,
+            logout_qqmusic,
+            open_qqmusic_webview_login,
+            extract_qqmusic_webview_cookie,
+            close_qqmusic_webview_login,
+            search_qqmusic_songs,
+            get_qqmusic_song_metadata,
+            get_qqmusic_playable_url,
+            import_qqmusic_song,
+            get_qqmusic_lyrics,
+            get_qqmusic_user_playlists,
+            get_qqmusic_playlist,
+            import_qqmusic_playlist,
+            get_qqmusic_liked_songs,
+            get_qqmusic_vip_status,
+            qqmusic_debug_dump,
+            get_qqmusic_user_profile
         ])
         .run(tauri::generate_context!())?;
     Ok(())

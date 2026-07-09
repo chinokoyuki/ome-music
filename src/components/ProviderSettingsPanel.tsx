@@ -46,11 +46,14 @@ import {
   ensureNeteaseApiService,
   getBilibiliSourceConfig,
   getNeteaseSourceConfig,
+  getQQMusicSourceConfig,
   NetEaseAccountSessionProvider,
   NetEaseMusicProvider,
+  QQMusicAccountSessionProvider,
   refreshLocalTracksAfterSourceImport,
   saveBilibiliSourceConfig,
   saveNeteaseSourceConfig,
+  saveQQMusicSourceConfig,
   testBilibiliSourceConnection,
   testNeteaseSourceConnection,
   type BilibiliDanmakuDebug,
@@ -62,6 +65,9 @@ import {
   type NetEaseServiceStage,
   type NetEaseServiceStatus,
   type NetEaseVipStatus,
+  type QQMusicLoginStatus,
+  type QQMusicVipStatus,
+  type QQMusicQrLogin,
   type MusicSourceConfig,
   type NetEaseUserPlaylist,
   type PlayableUrlOptions,
@@ -152,6 +158,7 @@ const neteaseProvider = new NetEaseMusicProvider();
 const neteaseAuthProvider = new NetEaseAccountSessionProvider();
 const bilibiliProvider = new BilibiliMusicProvider();
 const bilibiliAuthProvider = new BilibiliAccountSessionProvider();
+const qqmusicAuthProvider = new QQMusicAccountSessionProvider();
 
 // QR 会话状态机：waiting 等待扫码 / scanned 已扫描待确认 / expired 服务端判定过期 / timeout 客户端兜底超时
 type QrSessionStatus = "waiting" | "scanned" | "expired" | "timeout";
@@ -390,6 +397,19 @@ export function ProviderSettingsPanel({
   const [bilibiliLoginStatus, setBilibiliLoginStatus] = useState<BilibiliLoginStatus | null>(null);
   const [bilibiliQr, setBilibiliQr] = useState<NetEaseQrLogin | null>(null);
   const [isBilibiliOtherLoginOpen, setBilibiliOtherLoginOpen] = useState(false);
+  // QQ Music state
+  const [qqmusicEnabled, setQQMusicEnabled] = useState(false);
+  const [qqmusicBaseUrl, setQQMusicBaseUrl] = useState("https://c.y.qq.com");
+  const [qqmusicToken, setQQMusicToken] = useState("");
+  const [qqmusicLoginStatus, setQQMusicLoginStatus] = useState<QQMusicLoginStatus | null>(null);
+  const [qqmusicMsg, setQQMusicMsg] = useState<string | null>(null);
+  // QQ Music QR / VIP / Playlists
+  const [qqmusicQr, setQQMusicQr] = useState<QQMusicQrLogin | null>(null);
+  const [qqmusicQrStatus, setQQMusicQrStatus] = useState<string>("");
+  const [, setQQMusicVipStatus] = useState<QQMusicVipStatus | null>(null);
+  const [, setQQMusicUserPlaylists] = useState<NetEaseUserPlaylist[]>([]);
+  const [isCreatingQQMusicQr, setCreatingQQMusicQr] = useState(false);
+  const [isCheckingQQMusicLogin, setCheckingQQMusicLogin] = useState(false);
   const [danmakuSettings, setDanmakuSettings] = useState<DanmakuSettings>(defaultDanmakuSettings);
   const [neteasePlaylistId, setNeteasePlaylistId] = useState("");
   const [neteaseUserPlaylists, setNeteaseUserPlaylists] = useState<NetEaseUserPlaylist[]>([]);
@@ -433,9 +453,9 @@ export function ProviderSettingsPanel({
   const [isPasswordLogin, setPasswordLogin] = useState(false);
   const [isSendingSms, setSendingSms] = useState(false);
   const [isSmsLogin, setSmsLogin] = useState(false);
-  const [openingWebLoginSource, setOpeningWebLoginSource] = useState<"netease" | "bilibili" | null>(
-    null,
-  );
+  const [openingWebLoginSource, setOpeningWebLoginSource] = useState<
+    "netease" | "bilibili" | "qqmusic" | null
+  >(null);
   const [message, setMessage] = useState<string | null>(null);
   const [modelMessage, setModelMessage] = useState<string | null>(null);
   const [sourceMessage, setSourceMessage] = useState<string | null>(null);
@@ -513,6 +533,40 @@ export function ProviderSettingsPanel({
       setBilibiliToken("");
       if (loadedConfig.enabled) {
         void refreshBilibiliStatus();
+      }
+    });
+    // QQ Music config
+    void getQQMusicSourceConfig().then((loadedConfig) => {
+      if (cancelled) return;
+      setQQMusicEnabled(loadedConfig.enabled);
+      setQQMusicBaseUrl(loadedConfig.baseUrl);
+      setQQMusicToken("");
+      if (loadedConfig.enabled) {
+        void qqmusicAuthProvider
+          .getLoginStatus()
+          .then((status) => {
+            if (!cancelled) setQQMusicLoginStatus(status);
+            // 如果已登录，自动获取 VIP 状态
+            if (!cancelled && status.loggedIn) {
+              void qqmusicAuthProvider
+                .getMembershipStatus()
+                .then((vip) => {
+                  if (!cancelled) setQQMusicVipStatus(vip);
+                })
+                .catch(() => {});
+            }
+          })
+          .catch((e) => {
+            if (!cancelled)
+              setQQMusicLoginStatus({
+                loggedIn: false,
+                uin: "",
+                nickname: "",
+                avatarUrl: "",
+                vipType: "none",
+                message: readError(e),
+              });
+          });
       }
     });
 
@@ -792,6 +846,9 @@ export function ProviderSettingsPanel({
       const savedBilibiliConfig = await saveBilibiliDraft({
         token: bilibiliToken.trim() || undefined,
       });
+      const savedQQMusicConfig = await saveQQMusicDraft({
+        token: qqmusicToken.trim() || undefined,
+      });
       setConfig(savedConfig);
       setSpeechConfig(savedSpeechConfig);
       setProviderName(savedConfig.providerName);
@@ -800,6 +857,7 @@ export function ProviderSettingsPanel({
       setApiKey("");
       void savedMusicSourceConfig;
       void savedBilibiliConfig;
+      void savedQQMusicConfig;
       setMessage(
         savedConfig.configured
           ? "Saved. The curator will use this source first."
@@ -884,6 +942,21 @@ export function ProviderSettingsPanel({
     setBilibiliBaseUrl(savedConfig.baseUrl);
     setBilibiliSearchScope(savedConfig.searchScope);
     if (options?.token !== undefined) setBilibiliToken("");
+    return savedConfig;
+  };
+
+  // QQ 音乐草稿保存入口：与 saveSourceDraft/saveBilibiliDraft 同样的语义。
+  // 全局 Save 按钮必须显式保存 QQ 音乐的 token/启用状态/base_url，
+  // 否则用户在输入框粘贴 Cookie 后直接点 Save 会导致凭据丢失。
+  const saveQQMusicDraft = async (options?: { token?: string }) => {
+    const savedConfig = await saveQQMusicSourceConfig({
+      enabled: qqmusicEnabled,
+      baseUrl: qqmusicBaseUrl,
+      token: options?.token,
+    });
+    setQQMusicEnabled(savedConfig.enabled);
+    setQQMusicBaseUrl(savedConfig.baseUrl);
+    if (options?.token !== undefined) setQQMusicToken("");
     return savedConfig;
   };
 
@@ -1100,7 +1173,7 @@ export function ProviderSettingsPanel({
     }
   };
 
-  const openSecureWebLogin = async (source: "netease" | "bilibili") => {
+  const openSecureWebLogin = async (source: "netease" | "bilibili" | "qqmusic") => {
     setOpeningWebLoginSource(source);
     setSourceMessage(null);
     try {
@@ -1108,6 +1181,12 @@ export function ProviderSettingsPanel({
         await saveSourceDraft();
         const result = await neteaseAuthProvider.openSecureWebLogin();
         setSourceMessage(`${result.message} 登录后可导入 Cookie / Import Cookie after signing in.`);
+      } else if (source === "qqmusic") {
+        // QQ音乐：打开系统浏览器登录，然后点击「检测登录状态」或手动导入 Cookie
+        const result = await qqmusicAuthProvider.openSecureWebLogin();
+        setSourceMessage(
+          `${result.message} 登录完成后请点击「检测登录状态」。 / After signing in, click "Check Login".`,
+        );
       } else {
         await saveBilibiliDraft();
         const result = await bilibiliAuthProvider.openSecureWebLogin();
@@ -1117,6 +1196,76 @@ export function ProviderSettingsPanel({
       setSourceMessage(readError(error));
     } finally {
       setOpeningWebLoginSource(null);
+    }
+  };
+
+  // ── QQ Music QR Login ───────────────────────────────────────────
+  const createQQMusicQr = async () => {
+    setCreatingQQMusicQr(true);
+    setQQMusicMsg(null);
+    try {
+      const qr = await qqmusicAuthProvider.createQrLogin();
+      setQQMusicQr(qr);
+      setQQMusicQrStatus("waiting");
+      // Start polling with 2-minute timeout
+      const startTime = Date.now();
+      const TIMEOUT_MS = 120_000; // 2 minutes
+      const poll = async () => {
+        if (!qr.key) return;
+        if (Date.now() - startTime > TIMEOUT_MS) {
+          setQQMusicQrStatus("expired");
+          setQQMusicMsg("二维码已过期，请重新生成 / QR code timed out. Regenerate to try again.");
+          return;
+        }
+        try {
+          const result = await qqmusicAuthProvider.checkQrLoginStatus(qr.key, qr.cookies || "");
+          if (result.status === "confirmed" && result.cookie) {
+            // importCookie now verifies the cookie and returns actual login status
+            try {
+              const status = await qqmusicAuthProvider.importCookie(result.cookie);
+              setQQMusicLoginStatus(status);
+              setQQMusicQrStatus("confirmed");
+              setQQMusicMsg(
+                status.loggedIn
+                  ? `QQ音乐已连接${status.nickname ? ` · ${status.nickname}` : ""} / QQ Music connected.`
+                  : `登录失败: ${status.message} / Login failed.`,
+              );
+              // 登录成功后同步前端启用状态（后端 ensure_qqmusic_source_enabled 已设置 DB）
+              if (status.loggedIn) {
+                setQQMusicEnabled(true);
+                // Fetch VIP status
+                try {
+                  const vip = await qqmusicAuthProvider.getMembershipStatus();
+                  setQQMusicVipStatus(vip);
+                } catch {}
+              }
+            } catch (importErr) {
+              setQQMusicQrStatus("failed");
+              setQQMusicMsg(`登录确认失败: ${readError(importErr)} / Login confirmation failed.`);
+            }
+            return;
+          } else if (result.status === "scanned") {
+            setQQMusicQrStatus("scanned");
+          } else if (result.status === "expired") {
+            setQQMusicQrStatus("expired");
+            return;
+          } else if (result.status === "failed") {
+            setQQMusicQrStatus("failed");
+            setQQMusicMsg(result.message || "QR login failed.");
+            return;
+          }
+          setTimeout(poll, 1500);
+        } catch (pollErr) {
+          // 显示轮询错误但继续重试（可能是临时网络问题）
+          setQQMusicMsg(`轮询中: ${readError(pollErr)}`);
+          setTimeout(poll, 2000);
+        }
+      };
+      setTimeout(poll, 1500);
+    } catch (error) {
+      setQQMusicMsg(readError(error));
+    } finally {
+      setCreatingQQMusicQr(false);
     }
   };
 
@@ -1436,6 +1585,19 @@ export function ProviderSettingsPanel({
                               : "Off"
                         }
                         muted={!bilibiliEnabled}
+                      />
+                      <StatusTile
+                        icon={Music2}
+                        title="QQ Music"
+                        subtitle="QQ音乐"
+                        value={
+                          qqmusicLoginStatus?.loggedIn
+                            ? "Signed in"
+                            : qqmusicEnabled
+                              ? "Ready"
+                              : "Off"
+                        }
+                        muted={!qqmusicEnabled}
                       />
                       <StatusTile
                         icon={Radio}
@@ -2249,6 +2411,285 @@ export function ProviderSettingsPanel({
                         onLogout={logoutBilibili}
                         openingWebLogin={openingWebLoginSource === "bilibili"}
                       />
+
+                      {/* ── QQ Music Source Card ── */}
+                      <div className="space-y-4 rounded-[20px] bg-white/[0.035] p-4">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-3">
+                            <span className="flex h-9 w-9 items-center justify-center rounded-full bg-white/[0.07] text-white/64">
+                              <Music2 className="h-4 w-4" />
+                            </span>
+                            <div>
+                              <p className="text-sm font-semibold text-white/84">
+                                QQ音乐 / QQ Music
+                              </p>
+                              <p className="mt-1 text-xs text-white/36">
+                                {qqmusicLoginStatus?.loggedIn
+                                  ? `已连接${qqmusicLoginStatus.nickname ? ` · ${qqmusicLoginStatus.nickname}` : ""} / Signed in`
+                                  : qqmusicEnabled
+                                    ? "公共内容可用 / Public content available"
+                                    : "未启用 / Disabled"}
+                              </p>
+                            </div>
+                          </div>
+                          <label className="relative inline-flex cursor-pointer items-center">
+                            <input
+                              type="checkbox"
+                              className="peer sr-only"
+                              checked={qqmusicEnabled}
+                              onChange={async (e) => {
+                                setQQMusicEnabled(e.target.checked);
+                                await saveQQMusicSourceConfig({
+                                  enabled: e.target.checked,
+                                  baseUrl: qqmusicBaseUrl,
+                                });
+                              }}
+                            />
+                            <div className="h-6 w-11 rounded-full bg-white/15 peer-checked:bg-white/40 peer-focus:ring-2 peer-focus:ring-white/20" />
+                            <div className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white/80 transition-transform peer-checked:translate-x-5" />
+                          </label>
+                        </div>
+
+                        {/* Cookie 输入 */}
+                        <Field label="Cookie / 登录凭据">
+                          <input
+                            type="text"
+                            value={qqmusicToken}
+                            onChange={(e) => setQQMusicToken(e.target.value)}
+                            placeholder="粘贴 Cookie 粘贴导入 / Paste Cookie to import…"
+                            className="settings-input"
+                            autoComplete="off"
+                          />
+                        </Field>
+
+                        {/* 主按钮区：扫码登录 + 导入Cookie */}
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <button
+                            type="button"
+                            onClick={createQQMusicQr}
+                            disabled={isCreatingQQMusicQr}
+                            className="app-transition inline-flex h-11 items-center justify-center gap-2 rounded-full bg-white/[0.08] px-4 text-sm font-semibold text-white/72 hover:bg-white/[0.13] hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            {isCreatingQQMusicQr ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <QrCode className="h-4 w-4" />
+                            )}
+                            {qqmusicQr ? "重新生成 / New Code" : "扫码登录 / QR Login"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!qqmusicToken.trim()}
+                            onClick={async () => {
+                              setQQMusicMsg(null);
+                              try {
+                                const status = await qqmusicAuthProvider.importCookie(
+                                  qqmusicToken.trim(),
+                                );
+                                setQQMusicToken("");
+                                setQQMusicLoginStatus(status);
+                                if (status.loggedIn) setQQMusicEnabled(true);
+                                setQQMusicMsg(
+                                  status.loggedIn
+                                    ? `QQ音乐已连接${status.nickname ? ` · ${status.nickname}` : ""} / QQ Music connected.`
+                                    : status.message ||
+                                        "Cookie 无效或已过期 / Invalid or expired cookie.",
+                                );
+                              } catch (error) {
+                                setQQMusicMsg(readError(error));
+                              }
+                            }}
+                            className="app-transition inline-flex h-11 items-center justify-center gap-2 rounded-full bg-white/[0.08] px-4 text-sm font-semibold text-white/72 hover:bg-white/[0.13] hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            <ShieldCheck className="h-4 w-4" />
+                            导入 Cookie / Import
+                          </button>
+                        </div>
+
+                        {/* QR 码展示区 */}
+                        {qqmusicQr &&
+                          qqmusicQrStatus !== "confirmed" &&
+                          qqmusicQrStatus !== "failed" && (
+                            <div className="grid gap-4 rounded-[20px] bg-white/[0.04] p-4 sm:grid-cols-[128px_1fr]">
+                              {qqmusicQr.url ? (
+                                <img
+                                  src={qqmusicQr.url}
+                                  alt="QQ Music QR Code"
+                                  className="h-32 w-32 rounded-[16px] bg-white p-2"
+                                />
+                              ) : (
+                                <div className="flex h-32 w-32 items-center justify-center rounded-[16px] bg-white/[0.06] text-xs text-white/40">
+                                  二维码加载失败 / QR unavailable
+                                </div>
+                              )}
+                              <div className="flex flex-col justify-center">
+                                <p className="text-sm font-semibold text-white/80">
+                                  使用QQ扫码 / Scan with QQ
+                                </p>
+                                <p className="mt-2 text-sm leading-6 text-white/42">
+                                  {qqmusicQrStatus === "waiting" &&
+                                    "等待扫码确认… / Waiting for scan…"}
+                                  {qqmusicQrStatus === "scanned" &&
+                                    "已扫描，请在手机上确认 / Scanned. Confirm on your phone."}
+                                  {qqmusicQrStatus === "expired" &&
+                                    "二维码已过期，请重新生成 / QR code expired. Regenerate to try again."}
+                                </p>
+                                {qqmusicQrStatus === "expired" && (
+                                  <button
+                                    type="button"
+                                    onClick={createQQMusicQr}
+                                    disabled={isCreatingQQMusicQr}
+                                    className="app-transition mt-3 inline-flex h-9 w-fit items-center justify-center gap-2 rounded-full bg-white/[0.1] px-4 text-xs font-semibold text-white/72 hover:bg-white/[0.18] hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
+                                  >
+                                    {isCreatingQQMusicQr ? (
+                                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                    ) : (
+                                      <RefreshCw className="h-3.5 w-3.5" />
+                                    )}
+                                    重新生成 / Regenerate
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          )}
+
+                        {/* 辅助登录入口：网页登录 + 内置窗口登录 */}
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <button
+                            type="button"
+                            onClick={() => openSecureWebLogin("qqmusic")}
+                            disabled={false}
+                            className="app-transition inline-flex h-11 items-center justify-center gap-2 rounded-full bg-white/[0.08] px-4 text-sm font-semibold text-white/72 hover:bg-white/[0.13] hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            网页登录 / Web Login
+                          </button>
+                          <button
+                            type="button"
+                            disabled={false}
+                            onClick={async () => {
+                              try {
+                                await qqmusicAuthProvider.openWebviewLogin();
+                                setQQMusicMsg(
+                                  "已在新窗口打开QQ音乐，请登录后点击下方'提取Cookie'按钮 / QQ Music opened in new window. Login there, then click 'Extract Cookie'.",
+                                );
+                              } catch (e) {
+                                setQQMusicMsg(readError(e));
+                              }
+                            }}
+                            className="app-transition inline-flex h-11 items-center justify-center gap-2 rounded-full bg-white/[0.08] px-4 text-sm font-semibold text-white/72 hover:bg-white/[0.13] hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            内置窗口登录 / Webview Login
+                          </button>
+                        </div>
+
+                        {/* Webview Cookie 提取区 */}
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <button
+                            type="button"
+                            disabled={false}
+                            onClick={async () => {
+                              setQQMusicMsg(null);
+                              try {
+                                const cookie = await qqmusicAuthProvider.extractWebviewCookie();
+                                if (cookie) {
+                                  const status = await qqmusicAuthProvider.importCookie(cookie);
+                                  setQQMusicLoginStatus(status);
+                                  setQQMusicMsg(
+                                    status.loggedIn
+                                      ? `Webview登录成功${status.nickname ? ` · ${status.nickname}` : ""} / Webview login successful.`
+                                      : `Cookie已导入但验证未通过，请确保已在窗口中登录QQ音乐 / Cookie imported but verification failed. Make sure you are logged in.`,
+                                  );
+                                  if (status.loggedIn) {
+                                    setQQMusicEnabled(true);
+                                    await qqmusicAuthProvider.closeWebviewLogin();
+                                  }
+                                } else {
+                                  setQQMusicMsg(
+                                    "未能提取Cookie，请确保已登录 / Failed to extract cookie. Make sure you are logged in.",
+                                  );
+                                }
+                              } catch (e) {
+                                setQQMusicMsg(readError(e));
+                              }
+                            }}
+                            className="app-transition inline-flex h-11 items-center justify-center gap-2 rounded-full bg-emerald-600/20 px-4 text-sm font-semibold text-emerald-300 hover:bg-emerald-600/30 hover:text-emerald-200 disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            提取Cookie / Extract Cookie
+                          </button>
+                          <button
+                            type="button"
+                            disabled={false}
+                            onClick={async () => {
+                              try {
+                                await qqmusicAuthProvider.closeWebviewLogin();
+                                setQQMusicMsg("已关闭登录窗口 / Login window closed.");
+                              } catch (e) {
+                                setQQMusicMsg(readError(e));
+                              }
+                            }}
+                            className="app-transition inline-flex h-11 items-center justify-center gap-2 rounded-full bg-white/[0.08] px-4 text-sm font-semibold text-white/72 hover:bg-white/[0.13] hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            关闭窗口 / Close Window
+                          </button>
+                        </div>
+
+                        {/* 状态检测 + 登出 */}
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <button
+                            type="button"
+                            disabled={isCheckingQQMusicLogin}
+                            onClick={async () => {
+                              setQQMusicMsg(null);
+                              setCheckingQQMusicLogin(true);
+                              try {
+                                const status = await qqmusicAuthProvider.getLoginStatus();
+                                setQQMusicLoginStatus(status);
+                                if (status.loggedIn) setQQMusicEnabled(true);
+                                setQQMusicMsg(
+                                  status.loggedIn
+                                    ? `QQ音乐已连接${status.nickname ? ` · ${status.nickname}` : ""} / QQ Music connected.`
+                                    : status.message ||
+                                        "未检测到登录态。请先扫码登录或导入 Cookie。 / No session found.",
+                                );
+                              } catch (e) {
+                                setQQMusicMsg(readError(e));
+                              } finally {
+                                setCheckingQQMusicLogin(false);
+                              }
+                            }}
+                            className="app-transition inline-flex h-11 items-center justify-center gap-2 rounded-full bg-white/[0.08] px-4 text-sm font-semibold text-white/72 hover:bg-white/[0.13] hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            {isCheckingQQMusicLogin ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <ShieldCheck className="h-4 w-4" />
+                            )}
+                            检测登录 / Check Login
+                          </button>
+                          {qqmusicLoginStatus?.loggedIn && (
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const status = await qqmusicAuthProvider.logout();
+                                setQQMusicLoginStatus(status);
+                                setQQMusicVipStatus(null);
+                                setQQMusicUserPlaylists([]);
+                                setQQMusicMsg("已登出 / Signed out.");
+                              }}
+                              className="app-transition inline-flex h-11 items-center justify-center gap-2 rounded-full bg-white/[0.08] px-4 text-sm font-semibold text-white/72 hover:bg-white/[0.13] hover:text-white"
+                            >
+                              登出 / Sign Out
+                            </button>
+                          )}
+                        </div>
+
+                        {/* 操作反馈 */}
+                        {qqmusicMsg && (
+                          <p className="rounded-[14px] bg-white/[0.05] px-3 py-2 text-xs leading-5 text-white/54">
+                            {qqmusicMsg}
+                          </p>
+                        )}
+                      </div>
 
                       <div className="space-y-3 rounded-[20px] bg-white/[0.035] p-4">
                         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">

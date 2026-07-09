@@ -32,6 +32,51 @@ export interface MusicSourcePlaylist {
   tracks: MusicSourceSong[];
 }
 
+export interface QQMusicSourceConfig extends MusicSourceConfig {
+  searchScope: "all" | "song" | "album" | "playlist" | "mv";
+}
+
+export interface QQMusicLoginStatus {
+  loggedIn: boolean;
+  uin: string;
+  nickname: string;
+  avatarUrl: string;
+  vipType: "none" | "green" | "super";
+  message: string;
+}
+
+export interface QQMusicQrLogin {
+  url: string;
+  key: string;
+  cookies: string;
+}
+
+export interface QQMusicQrCheck {
+  status: "waiting" | "scanned" | "confirmed" | "expired" | "failed";
+  cookie?: string;
+  message?: string;
+}
+
+export interface QQMusicMembership {
+  vipType: "none" | "green" | "super";
+  expireDate: string;
+}
+
+export interface QQMusicVipStatus {
+  isMember: boolean;
+  level: string | null;
+  message: string;
+  membershipKnown: boolean;
+}
+
+export interface QQMusicUserProfile {
+  loggedIn: boolean;
+  nickname: string | null;
+  userId: string | null;
+  avatarUrl: string | null;
+  vip: QQMusicVipStatus | null;
+}
+
 export interface NetEaseUserPlaylist {
   id: string;
   name: string;
@@ -660,6 +705,259 @@ export class BilibiliAccountSessionProvider {
   }
 }
 
+const emptyQQMusicConfig: QQMusicSourceConfig = {
+  enabled: false,
+  baseUrl: "https://c.y.qq.com",
+  hasToken: false,
+  maskedToken: "",
+  searchScope: "all",
+};
+
+export async function getQQMusicSourceConfig(): Promise<QQMusicSourceConfig> {
+  if (!isTauriRuntime()) return readPreviewQQMusicConfig();
+  return invoke<QQMusicSourceConfig>("get_qqmusic_source_config");
+}
+
+export async function saveQQMusicSourceConfig(
+  payload: SaveBilibiliSourceConfigPayload,
+): Promise<QQMusicSourceConfig> {
+  if (!isTauriRuntime()) {
+    const nextConfig: QQMusicSourceConfig = {
+      ...readPreviewQQMusicConfig(),
+      enabled: payload.enabled,
+      baseUrl: payload.baseUrl || "https://c.y.qq.com",
+      hasToken: Boolean(payload.token) || readPreviewQQMusicConfig().hasToken,
+      maskedToken: payload.token ? "••••••••••••" : readPreviewQQMusicConfig().maskedToken,
+      searchScope: (payload.searchScope as QQMusicSourceConfig["searchScope"]) ?? "all",
+    };
+    window.localStorage.setItem("ome.source.qqmusic.preview", JSON.stringify(nextConfig));
+    return nextConfig;
+  }
+  return invoke<QQMusicSourceConfig>("save_qqmusic_source_config", { payload });
+}
+
+export async function testQQMusicSourceConnection(
+  payload: SaveBilibiliSourceConfigPayload,
+): Promise<string> {
+  if (!isTauriRuntime()) return "Connected. QQ Music is ready.";
+  const response = await invoke<{ ok: boolean; message: string }>(
+    "test_qqmusic_source_connection",
+    { payload },
+  );
+  return response.message;
+}
+
+export class QQMusicProvider {
+  private readonly searchCache = new Map<string, { expiresAt: number; songs: MusicSourceSong[] }>();
+  private readonly searchRequests = new Map<string, Promise<MusicSourceSong[]>>();
+
+  async searchSongs(query: string): Promise<MusicSourceSong[]> {
+    if (!isTauriRuntime()) return previewQQMusicSongs(query);
+    const cacheKey = query.trim().toLocaleLowerCase();
+    const cached = this.searchCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.songs;
+
+    const inFlight = this.searchRequests.get(cacheKey);
+    if (inFlight) return inFlight;
+
+    const request = invoke<MusicSourceSong[]>("search_qqmusic_songs", {
+      payload: { query: query.trim(), page: 1, pageSize: 20 },
+    })
+      .then((songs) => {
+        this.searchCache.set(cacheKey, { expiresAt: Date.now() + 2 * 60_000, songs });
+        return songs;
+      })
+      .finally(() => this.searchRequests.delete(cacheKey));
+    this.searchRequests.set(cacheKey, request);
+    return request;
+  }
+
+  async getSongMetadata(songMid: string): Promise<MusicSourceSong> {
+    if (!isTauriRuntime()) return previewQQMusicSongs(songMid)[0];
+    return invoke<MusicSourceSong>("get_qqmusic_song_metadata", {
+      payload: { songId: songMid },
+    });
+  }
+
+  async getPlayableUrl(songId: string, options?: PlayableUrlOptions): Promise<PlayableUrlResult> {
+    if (!isTauriRuntime()) {
+      return { songId, url: null, unavailable: true, reason: "api_failed", debug: null };
+    }
+    return invoke<PlayableUrlResult>("get_qqmusic_playable_url", {
+      payload: { songId, quality: options?.level ?? "standard" },
+    });
+  }
+
+  async getLyrics(songMid: string): Promise<string> {
+    if (!isTauriRuntime()) return `[00:00.00]A quiet line for ${songMid}`;
+    const response = await invoke<SourceLyricsResult>("get_qqmusic_lyrics", {
+      payload: { songId: songMid },
+    });
+    return response.lyrics;
+  }
+
+  async importSong(songId: string): Promise<Track[]> {
+    if (!isTauriRuntime()) return [previewQQMusicTrack(songId)];
+    return invoke<Track[]>("import_qqmusic_song", { payload: { songId } });
+  }
+
+  async getPlaylist(disstid: string): Promise<MusicSourcePlaylist> {
+    if (!isTauriRuntime()) {
+      return {
+        id: disstid,
+        name: "QQ Music Playlist",
+        description: "",
+        source: "qqmusic",
+        tracks: [],
+      };
+    }
+    return invoke<MusicSourcePlaylist>("get_qqmusic_playlist", {
+      payload: { playlistId: disstid },
+    });
+  }
+
+  async importPlaylist(disstid: string): Promise<MusicSourcePlaylist> {
+    if (!isTauriRuntime()) {
+      return {
+        id: disstid,
+        name: "QQ Music Playlist",
+        description: "",
+        source: "qqmusic",
+        tracks: [],
+      };
+    }
+    return invoke<MusicSourcePlaylist>("import_qqmusic_playlist", {
+      payload: { playlistId: disstid },
+    });
+  }
+
+  async getUserPlaylists(): Promise<NetEaseUserPlaylist[]> {
+    if (!isTauriRuntime()) return [];
+    return invoke<NetEaseUserPlaylist[]>("get_qqmusic_user_playlists");
+  }
+
+  async getLikedSongs(_limit = 100): Promise<MusicSourceSong[]> {
+    if (!isTauriRuntime()) return [];
+    return invoke<MusicSourceSong[]>("get_qqmusic_liked_songs", { limit: _limit });
+  }
+}
+
+export class QQMusicAccountSessionProvider {
+  getSupportedLoginMethods(): LoginMethod[] {
+    return ["qr", "cookie_import", "webview_login"];
+  }
+
+  async createQrLogin(): Promise<QQMusicQrLogin> {
+    if (!isTauriRuntime()) {
+      return { url: "https://y.qq.com/", key: "preview", cookies: "" };
+    }
+    return invoke<QQMusicQrLogin>("create_qqmusic_qr_login");
+  }
+
+  async checkQrLoginStatus(key: string, cookies: string): Promise<QQMusicQrCheck> {
+    if (!isTauriRuntime()) {
+      return { status: "waiting", message: "Waiting for scan." };
+    }
+    return invoke<QQMusicQrCheck>("check_qqmusic_qr_login", { payload: { key, cookies } });
+  }
+
+  async importCookie(cookie: string): Promise<QQMusicLoginStatus> {
+    if (!isTauriRuntime())
+      return {
+        loggedIn: true,
+        uin: "",
+        nickname: "",
+        avatarUrl: "",
+        vipType: "none",
+        message: "Connected to QQ Music.",
+      };
+    return invoke<QQMusicLoginStatus>("import_qqmusic_token", { payload: { cookie } });
+  }
+
+  /** 打开 QQ 音乐 webview 登录窗口 */
+  async openWebviewLogin(): Promise<void> {
+    if (!isTauriRuntime()) return;
+    return invoke<void>("open_qqmusic_webview_login");
+  }
+
+  /** 从 webview 窗口提取 cookie */
+  async extractWebviewCookie(): Promise<string> {
+    if (!isTauriRuntime()) return "";
+    return invoke<string>("extract_qqmusic_webview_cookie");
+  }
+
+  /** 诊断：导出 cookie 和提取值的详细信息 */
+  async debugDump(): Promise<Record<string, unknown>> {
+    if (!isTauriRuntime()) return {};
+    return invoke<Record<string, unknown>>("qqmusic_debug_dump");
+  }
+
+  /** 关闭 webview 登录窗口 */
+  async closeWebviewLogin(): Promise<void> {
+    if (!isTauriRuntime()) return;
+    return invoke<void>("close_qqmusic_webview_login");
+  }
+
+  async getLoginStatus(): Promise<QQMusicLoginStatus> {
+    if (!isTauriRuntime())
+      return {
+        loggedIn: false,
+        uin: "",
+        nickname: "",
+        avatarUrl: "",
+        vipType: "none",
+        message: "Public content is available.",
+      };
+    return invoke<QQMusicLoginStatus>("get_qqmusic_login_status");
+  }
+
+  async refreshSession(): Promise<QQMusicLoginStatus> {
+    return this.getLoginStatus();
+  }
+
+  async logout(): Promise<QQMusicLoginStatus> {
+    if (!isTauriRuntime())
+      return {
+        loggedIn: false,
+        uin: "",
+        nickname: "",
+        avatarUrl: "",
+        vipType: "none",
+        message: "Signed out.",
+      };
+    return invoke<QQMusicLoginStatus>("logout_qqmusic");
+  }
+
+  async getUserProfile(): Promise<QQMusicUserProfile> {
+    if (!isTauriRuntime()) {
+      return { loggedIn: false, nickname: null, userId: null, avatarUrl: null, vip: null };
+    }
+    return invoke<QQMusicUserProfile>("get_qqmusic_user_profile");
+  }
+
+  async getMembershipStatus(): Promise<QQMusicVipStatus> {
+    if (!isTauriRuntime()) {
+      return { isMember: false, level: null, message: "Not available.", membershipKnown: false };
+    }
+    return invoke<QQMusicVipStatus>("get_qqmusic_vip_status");
+  }
+
+  async testConnection(): Promise<SourceConnectionMessage> {
+    if (!isTauriRuntime()) return { ok: true, message: "Connected. QQ Music is ready." };
+    return invoke<SourceConnectionMessage>("test_qqmusic_source_connection", {
+      payload: { enabled: true, baseUrl: "https://c.y.qq.com" },
+    });
+  }
+
+  async openSecureWebLogin(): Promise<SourceConnectionMessage> {
+    if (!isTauriRuntime())
+      return { ok: true, message: "Open QQ Music in your browser, then import Cookie." };
+    return invoke<SourceConnectionMessage>("open_source_web_login", {
+      payload: { source: "qqmusic" },
+    });
+  }
+}
+
 export class NetEaseMusicProvider implements MusicSourceProvider {
   async searchSongs(query: string): Promise<MusicSourceSong[]> {
     if (!isTauriRuntime()) return previewSongs(query);
@@ -1053,5 +1351,57 @@ function previewTasteNotes(): TasteNotes {
       "Start with familiar voices, then bring in adjacent songs with restraint.",
     confidence: 0.12,
     updatedAt: new Date().toISOString(),
+  };
+}
+
+// ── QQ Music Preview / Mock Data ──────────────────────────────────────
+
+function readPreviewQQMusicConfig(): QQMusicSourceConfig {
+  try {
+    const raw = window.localStorage.getItem("ome.source.qqmusic.preview");
+    return raw ? { ...emptyQQMusicConfig, ...JSON.parse(raw) } : emptyQQMusicConfig;
+  } catch {
+    return emptyQQMusicConfig;
+  }
+}
+
+function previewQQMusicSongs(query: string): MusicSourceSong[] {
+  return [
+    {
+      id: query.startsWith("00") ? query : "003OUlho2HcRHC",
+      source: "qqmusic",
+      title: query || "QQ音乐 Preview",
+      artist: "QQ音乐",
+      album: "Preview Album",
+      durationSeconds: 240,
+      coverUrl: "",
+      playableUrl: null,
+      unavailable: false,
+      sourceUrl: "https://y.qq.com/n/ryqq/songDetail/003OUlho2HcRHC",
+    },
+  ];
+}
+
+function previewQQMusicTrack(songId: string): Track {
+  const song = previewQQMusicSongs(songId)[0];
+  return {
+    id: `preview-qqmusic-${song.id}`,
+    title: song.title,
+    artist: song.artist,
+    album: song.album,
+    durationSeconds: song.durationSeconds ?? 240,
+    filePath: `preview://qqmusic/${song.id}`,
+    source: "qqmusic",
+    sourceId: song.id,
+    unavailableReason: null,
+    coverUrl: song.coverUrl ?? "",
+    genres: ["Mandopop"],
+    moods: ["calm", "dreamy"],
+    language: "zh",
+    year: 2024,
+    playCount: 0,
+    skipCount: 0,
+    liked: false,
+    importedAt: new Date().toISOString(),
   };
 }

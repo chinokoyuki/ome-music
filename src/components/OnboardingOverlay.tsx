@@ -30,10 +30,12 @@ interface OnboardingOverlayProps {
   localTrackCount: number;
   neteaseLoggedIn: boolean;
   bilibiliLoggedIn: boolean;
+  qqmusicLoggedIn: boolean;
   onClose: () => void;
   onImportMusic: () => void;
   onOpenNeteaseSettings: () => void;
   onOpenBilibiliSettings: () => void;
+  onOpenQQMusicSettings: () => void;
 }
 
 interface OnboardingStep {
@@ -52,10 +54,12 @@ export function OnboardingOverlay({
   localTrackCount,
   neteaseLoggedIn,
   bilibiliLoggedIn,
+  qqmusicLoggedIn,
   onClose,
   onImportMusic,
   onOpenNeteaseSettings,
   onOpenBilibiliSettings,
+  onOpenQQMusicSettings,
 }: OnboardingOverlayProps) {
   const [stepIndex, setStepIndex] = useState(0);
 
@@ -112,6 +116,16 @@ export function OnboardingOverlay({
       body: "Bilibili can provide music, covers, video atmosphere, and a gentle danmaku layer after sign-in.",
       cta: { label: "\u6253\u5f00\u8bbe\u7f6e", onClick: onOpenBilibiliSettings },
       done: bilibiliLoggedIn,
+      doneLabel: "\u5df2\u767b\u5f55",
+    },
+    {
+      id: "qqmusic",
+      icon: Cloud,
+      title: "\u8fde\u63a5 QQ\u97f3\u4e50",
+      subtitle: "QQ Music",
+      body: "QQ Music adds another rich catalog. Sign in to unlock high-quality streaming and your playlists.",
+      cta: { label: "\u6253\u5f00\u8bbe\u7f6e", onClick: onOpenQQMusicSettings },
+      done: qqmusicLoggedIn,
       doneLabel: "\u5df2\u767b\u5f55",
     },
     {

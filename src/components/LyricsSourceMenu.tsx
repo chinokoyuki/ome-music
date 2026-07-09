@@ -15,6 +15,7 @@ import {
   BilibiliAccountSessionProvider,
   getBilibiliSourceConfig,
   getNeteaseSourceConfig,
+  getQQMusicSourceConfig,
   type BilibiliLoginStatus,
   type BilibiliSourceConfig,
   type MusicSourceConfig,
@@ -22,6 +23,8 @@ import {
   type NetEasePlaybackDebug,
   type NetEaseServiceStatus,
   type PlayableUrlOptions,
+  type QQMusicLoginStatus,
+  type QQMusicSourceConfig,
 } from "../features/musicSources/provider";
 import type { Track } from "../types/music";
 import { getDanmakuSettings, type DanmakuSettings } from "../features/danmaku/danmakuSettings";
@@ -33,6 +36,8 @@ interface LyricsSourceMenuProps {
   playbackDebug: NetEasePlaybackDebug | null;
   serviceStatus: NetEaseServiceStatus | null;
   loginStatus: NetEaseLoginStatus | null;
+  bilibiliLoginStatus: BilibiliLoginStatus | null;
+  qqmusicLoginStatus: QQMusicLoginStatus | null;
   playbackQuality: NonNullable<PlayableUrlOptions["level"]>;
   onReloadLyrics: () => void;
   onImportLyrics: () => void;
@@ -63,6 +68,8 @@ export function LyricsSourceMenu({
   playbackDebug,
   serviceStatus,
   loginStatus,
+  bilibiliLoginStatus: _bilibiliLoginStatus,
+  qqmusicLoginStatus,
   playbackQuality,
   onReloadLyrics,
   onImportLyrics,
@@ -79,6 +86,7 @@ export function LyricsSourceMenu({
   const [neteaseConfig, setNeteaseConfig] = useState<MusicSourceConfig | null>(null);
   const [bilibiliConfig, setBilibiliConfig] = useState<BilibiliSourceConfig | null>(null);
   const [bilibiliStatus, setBilibiliStatus] = useState<BilibiliLoginStatus | null>(null);
+  const [qqmusicConfig, setQQMusicConfig] = useState<QQMusicSourceConfig | null>(null);
   const [danmakuSettings, setDanmakuSettings] = useState<DanmakuSettings>(() =>
     getDanmakuSettings(),
   );
@@ -119,11 +127,13 @@ export function LyricsSourceMenu({
       getNeteaseSourceConfig(),
       getBilibiliSourceConfig(),
       bilibiliAccount.getLoginStatus(),
-    ]).then(([netease, bilibili, status]) => {
+      getQQMusicSourceConfig(),
+    ]).then(([netease, bilibili, status, qqmusic]) => {
       if (cancelled) return;
       if (netease.status === "fulfilled") setNeteaseConfig(netease.value);
       if (bilibili.status === "fulfilled") setBilibiliConfig(bilibili.value);
       if (status.status === "fulfilled") setBilibiliStatus(status.value);
+      if (qqmusic.status === "fulfilled") setQQMusicConfig(qqmusic.value);
     });
     return () => {
       cancelled = true;
@@ -134,7 +144,8 @@ export function LyricsSourceMenu({
   const sourceReady =
     track?.source === "local" ||
     (track?.source === "netease" && Boolean(serviceStatus?.running || playbackDebug?.hasUrl)) ||
-    (track?.source === "bilibili" && Boolean(bilibiliConfig?.enabled));
+    (track?.source === "bilibili" && Boolean(bilibiliConfig?.enabled)) ||
+    (track?.source === "qqmusic" && Boolean(qqmusicConfig?.enabled));
 
   return (
     <div
@@ -251,6 +262,18 @@ export function LyricsSourceMenu({
                       : "Off"
                 }
                 ready={Boolean(bilibiliConfig?.enabled)}
+              />
+              <SourceStatusRow
+                icon={Cloud}
+                name="QQ音乐"
+                status={
+                  qqmusicLoginStatus?.loggedIn
+                    ? "已连接"
+                    : qqmusicConfig?.enabled
+                      ? "公共内容可用"
+                      : "关闭"
+                }
+                ready={Boolean(qqmusicConfig?.enabled)}
               />
             </div>
           </QuickSection>
@@ -378,6 +401,7 @@ function SourceStatusRow({
 function sourceLabel(source?: string): string {
   if (source === "netease") return "\u7f51\u6613\u4e91\u97f3\u4e50 / NetEase Cloud Music";
   if (source === "bilibili") return "Bilibili Video Atmosphere";
+  if (source === "qqmusic") return "QQ\u97f3\u4e50";
   return "\u672c\u5730\u97f3\u4e50 / Local Library";
 }
 
