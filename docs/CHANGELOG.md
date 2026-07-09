@@ -6,6 +6,22 @@ This project follows small, traceable releases. Keep entries short and focused o
 
 - No unreleased changes yet.
 
+## [0.3.8] - 2026-07-09
+
+Maintenance release. No new user-facing features. Focuses on cleaning up the QQ Music settings UI and tightening CI/lint hygiene.
+
+### Changed
+
+- QQ Music settings panel trimmed: removed unused VIP status badge, playlist shelf, test-connection / check-VIP / debug buttons, and the associated dead event handlers and state. The remaining buttons were re-laid into a uniform 2-column grid matching the NetEase and Bilibili cards.
+- `webview2-com` and `windows` crate dependencies moved under `[target.'cfg(windows)'.dependencies]` so Linux CI no longer attempts to compile Windows-only WebView2 cookie-extraction code.
+- Bumped version to 0.3.8.
+
+### Fixed
+
+- Resolved all Rust `unused variable` / `unused assignment` warnings and clippy errors (`needless-range-loop`, `manual-pattern-char-comparison`, `manual-strip`) so `cargo clippy --workspace -- -D warnings` passes clean.
+- Resolved ESLint `@typescript-eslint/no-unused-vars` errors in `LyricsSourceMenu.tsx` and `ProviderSettingsPanel.tsx`.
+- docs:check now passes: README, README.zh-CN, BUILD.md, and CHANGELOG.md all reference the canonical 0.3.8 version.
+
 ## [0.3.7] - 2026-06-30
 
 Stability release. No new features. Focuses on fixing the NetEase login/playback state mismatch and overlay/lyrics/danmaku/UI issues exposed during v0.3.6 acceptance, plus unblocking local music playback from user-picked folders outside `$HOME/Music`.

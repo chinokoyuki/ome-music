@@ -36,7 +36,7 @@ npm run release:windows
 Expected outputs:
 
 - `src-tauri/target/release/ome-music-player.exe`
-- `src-tauri/target/release/bundle/nsis/Ome.Music_0.3.7_x64-setup.exe`
+- `src-tauri/target/release/bundle/nsis/Ome.Music_0.3.8_x64-setup.exe`
 
 The release executable and installer should not require `npm`, `cargo`, Vite, or a development server on the user's machine.
 
@@ -56,8 +56,8 @@ they do not create or update a GitHub Release.
 Example:
 
 ```bash
-git tag v0.3.7
-git push origin v0.3.7
+git tag v0.3.8
+git push origin v0.3.8
 ```
 
 The tagged workflow should create a GitHub Release and upload the Windows NSIS installer.

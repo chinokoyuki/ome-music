@@ -1,4 +1,4 @@
-﻿# Ome Music
+# Ome Music
 
 English | [中文](./README.zh-CN.md)
 
@@ -9,7 +9,7 @@ You do not need to know Node.js, Rust, Vite, URLs, packaging, or command lines t
 ## For Normal Users
 
 1. Open the [GitHub Releases page](https://github.com/zerolyx/ome-music/releases).
-2. Download `Ome.Music_0.3.7_x64-setup.exe`.
+2. Download `Ome.Music_0.3.8_x64-setup.exe`.
 3. Double-click the setup file and follow the installer.
 4. Open Ome Music from the Start Menu or desktop shortcut.
 5. Search a song, import local music, or scan the QR code in Settings to connect NetEase Cloud Music.

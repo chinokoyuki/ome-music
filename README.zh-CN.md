@@ -1,4 +1,4 @@
-﻿# Ome Music
+# Ome Music
 
 [English](./README.md) | 中文
 
@@ -9,7 +9,7 @@ Ome Music 是一个给普通用户使用的 Windows 音乐播放器。目标很�
 ## 普通用户怎么安装
 
 1. 打开 [GitHub Releases 页面](https://github.com/zerolyx/ome-music/releases)。
-2. 下载 `Ome.Music_0.3.7_x64-setup.exe`。
+2. 下载 `Ome.Music_0.3.8_x64-setup.exe`。
 3. 双击安装包，按提示安装。
 4. 从桌面快捷方式或开始菜单打开 Ome Music。
 5. 直接搜索歌曲、导入本地音乐，或者在设置里扫码连接网易云音乐。
