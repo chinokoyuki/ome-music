@@ -247,9 +247,9 @@ fn resolve_qqmusic_gtk(config: &ResolvedQQMusicSourceConfig) -> (u32, u32) {
     let g_tk = qqmusic_gtk(key_old);
 
     eprintln!(
-        "[QQMusic] g_tk={g_tk}, g_tk_new_20200303={g_tk_new} (key_new='{}', key_old='{}')",
-        &key_new[..key_new.len().min(20)],
-        &key_old[..key_old.len().min(20)]
+        "[QQMusic] g_tk={g_tk}, g_tk_new_20200303={g_tk_new} (key_new_len={}, key_old_len={})",
+        key_new.len(),
+        key_old.len()
     );
     (g_tk, g_tk_new)
 }
@@ -1495,7 +1495,6 @@ fn extract_cookie_value(cookie: &str) -> Option<String> {
                     .trim_start_matches('0')
                     .to_string();
                 if !cleaned.is_empty() {
-                    eprintln!("[QQMusic] extract_cookie_value: matched '{name}' → {cleaned}");
                     return Some(cleaned);
                 }
             }
@@ -1505,13 +1504,6 @@ fn extract_cookie_value(cookie: &str) -> Option<String> {
         "[QQMusic] extract_cookie_value: no uin found in cookie (len={})",
         cookie.len()
     );
-    // 调试：输出所有含 "uin" 的 cookie 段
-    for part in cookie.split(';') {
-        let part = part.trim();
-        if part.to_lowercase().contains("uin") {
-            eprintln!("[QQMusic]   cookie part with 'uin': {part}");
-        }
-    }
     None
 }
 
@@ -1720,7 +1712,6 @@ pub fn debug_dump_qqmusic(db: &Connection) -> serde_json::Value {
         "config_enabled": config.as_ref().map(|c| c.enabled).unwrap_or(false),
         "token_exists": token.is_some(),
         "token_length": cookie_str.len(),
-        "token_preview": safe_preview(cookie_str, 200),
         "contains_qqmusic_key": cookie_str.contains("qqmusic_key="),
         "contains_uin": cookie_str.contains("uin="),
         "contains_pt2gguin": cookie_str.contains("pt2gguin="),
@@ -1730,7 +1721,6 @@ pub fn debug_dump_qqmusic(db: &Connection) -> serde_json::Value {
         "g_tk": g_tk,
         "g_tk_new": g_tk_new,
         "qqmusic_key_length": qqmusic_key.len(),
-        "qqmusic_key_preview": safe_preview(&qqmusic_key, 30),
         "p_skey_length": p_skey.len(),
         "superkey_length": superkey.len(),
     })
@@ -1941,20 +1931,6 @@ pub async fn verify_qqmusic_session(
         }
         Err(e) => {
             eprintln!("[QQMusic] verify_session 方式3错误: {e}");
-        }
-    }
-
-    // 方式4: 所有 API 验证均失败（通常 500005），但 cookie 中包含有效 uin 和 qqmusic_key/p_skey，
-    // 说明用户确实已登录，只是 musicu.fcg API 不接受我们的请求格式。
-    // 此时仍接受登录，后续搜索/播放等操作使用 Cookie 头认证。
-    // 此回退放在 match 外部，确保即使方式3的 HTTP 请求本身失败（Err）也能触发。
-    if uin_num > 0 {
-        let has_key = !qqmusic_key.is_empty()
-            || extract_cookie_raw(cookie_str, "p_skey").is_some()
-            || extract_cookie_raw(cookie_str, "superkey").is_some();
-        if has_key {
-            eprintln!("[QQMusic] verify_session 方式4: API验证失败但cookie含有效凭据(uin={uin_num}, has_key={has_key})，接受登录");
-            return Ok((uin_str, "QQ音乐用户".to_string()));
         }
     }
 
@@ -3173,7 +3149,7 @@ async fn follow_qqmusic_login_redirect(
                                                     }
                                                     eprintln!(
                                                         "[QQMusic]   form hidden params: {:?}",
-                                                        &form_params
+                                                        form_params
                                                     );
                                                     let mut form_url_with_params = form_url;
                                                     if !form_params.is_empty() {
@@ -3615,10 +3591,6 @@ pub async fn fetch_qqmusic_vip_status(
         extract_cookie_raw(cookie_str, "p_skey").is_some(),
         extract_cookie_raw(cookie_str, "skey").is_some(),
         extract_cookie_raw(cookie_str, "uin").is_some()
-    );
-    eprintln!(
-        "[QQMusic]   cookie (前200字符): {}",
-        safe_preview(cookie_str, 200)
     );
 
     // comm 对象必须包含完整字段，与 verify_qqmusic_session 一致，

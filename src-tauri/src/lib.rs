@@ -1566,14 +1566,6 @@ async fn get_qqmusic_login_status(
         token.is_some(),
         token.as_deref().map(|s| s.len()).unwrap_or(0)
     );
-    if let Some(ref t) = token {
-        eprintln!(
-            "[QQMusic] login_status: contains qqmusic_key={}, contains uin={}, preview={}",
-            t.contains("qqmusic_key="),
-            t.contains("uin="),
-            &t[..t.len().min(200)]
-        );
-    }
     let Some(ref cookie) = token else {
         return Ok(qqmusic::QQMusicLoginStatusDto {
             logged_in: false,
@@ -1600,41 +1592,17 @@ async fn get_qqmusic_login_status(
             message: "QQ音乐已连接 / QQ Music connected.".to_string(),
         }),
         Err(e) => {
-            // 验证失败但保留 token，让用户可以重试
-            // 安全网：即使 verify_session 失败，如果 cookie 中仍含有效凭据
-            // （uin > 0 且有 qqmusic_key），仍认为已登录
-            let cookie_str = cookie.as_str();
-            let has_qqmusic_key = cookie_str.contains("qqmusic_key=")
-                || cookie_str.contains("p_skey=")
-                || cookie_str.contains("superkey=");
-            // 检查 cookie 中是否有 uin 相关字段
-            let has_uin = cookie_str.contains("uin=")
-                || cookie_str.contains("pt2gguin=")
-                || cookie_str.contains("superuin=");
-            eprintln!("[QQMusic] login_status: verify failed, but checking cookie: has_key={has_qqmusic_key}, has_uin={has_uin}");
-            if has_qqmusic_key && has_uin {
-                // cookie 中有有效凭据，认为已登录（API 验证失败可能是格式问题）
-                let uin_str = qqmusic::resolve_qqmusic_uin(&config);
-                Ok(qqmusic::QQMusicLoginStatusDto {
-                    logged_in: true,
-                    uin: uin_str,
-                    nickname: "QQ音乐用户".to_string(),
-                    avatar_url: String::new(),
-                    vip_type: "none".to_string(),
-                    message:
-                        "QQ音乐已连接（API验证跳过） / QQ Music connected (API verify skipped)."
-                            .to_string(),
-                })
-            } else {
-                Ok(qqmusic::QQMusicLoginStatusDto {
-                    logged_in: false,
-                    uin: String::new(),
-                    nickname: String::new(),
-                    avatar_url: String::new(),
-                    vip_type: "none".to_string(),
-                    message: format!("验证失败: {e} / Verification failed. Token retained."),
-                })
-            }
+            // 验证失败：不信任 cookie 文本本身是否包含 key/uin，
+            // 只有服务端验证通过才标记已登录。token 保留以便用户重试。
+            eprintln!("[QQMusic] login_status: verify failed: {e}");
+            Ok(qqmusic::QQMusicLoginStatusDto {
+                logged_in: false,
+                uin: String::new(),
+                nickname: String::new(),
+                avatar_url: String::new(),
+                vip_type: "none".to_string(),
+                message: format!("验证失败: {e} / Verification failed. Token retained."),
+            })
         }
     }
 }
