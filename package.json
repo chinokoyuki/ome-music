@@ -12,6 +12,7 @@
     "netease:api": "NeteaseCloudMusicApi",
     "size:audit": "node scripts/size-audit.mjs",
     "docs:check": "node scripts/docs-check.mjs",
+    "test": "node scripts/regression-check.mjs",
     "lint": "eslint .",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"*.{js,mjs,json}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"*.{js,mjs,json}\"",
