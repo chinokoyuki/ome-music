@@ -16,19 +16,6 @@ use std::collections::HashMap;
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 
-/// 安全截断字符串到指定字节长度，避免在 UTF-8 字符中间切分导致 panic
-/// Safely truncate a string to a byte length, avoiding panics on UTF-8 char boundaries
-fn safe_preview(s: &str, n: usize) -> &str {
-    if s.len() <= n {
-        return s;
-    }
-    let mut end = n;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 use crate::{
     is_proxyable_remote_url, register_media_proxy, AppState, PlayableUrlDto, SourceSongDto,
 };
@@ -41,6 +28,124 @@ pub const QQMUSIC_DEFAULT_BASE_URL: &str = "https://c.y.qq.com";
 pub const QQMUSIC_U_BASE_URL: &str = "https://u.y.qq.com";
 pub const QQMUSIC_REFERER: &str = "https://y.qq.com/portal/player.html";
 pub const QQMUSIC_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const QQMUSIC_MAX_MEDIA_CANDIDATES: usize = 12;
+
+fn is_trusted_qqmusic_api_host(host: &str) -> bool {
+    matches!(host, "c.y.qq.com" | "u.y.qq.com" | "y.qq.com")
+}
+
+fn is_trusted_qqmusic_login_host(host: &str) -> bool {
+    host == "y.qq.com"
+        || host.ends_with(".y.qq.com")
+        || host == "graph.qq.com"
+        || host == "ptlogin2.qq.com"
+        || host.ends_with(".ptlogin2.qq.com")
+}
+
+pub fn is_trusted_qqmusic_webview_url(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .ok()
+        .filter(|url| {
+            url.scheme() == "https"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port_or_known_default() == Some(443)
+        })
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host == "y.qq.com" || host.ends_with(".y.qq.com"))
+        })
+        .unwrap_or(false)
+}
+
+fn is_trusted_qqmusic_media_host(host: &str) -> bool {
+    host == "y.gtimg.cn"
+        || host.ends_with(".gtimg.cn")
+        || host == "q.qlogo.cn"
+        || host == "qqmusic.qq.com"
+        || host.ends_with(".qqmusic.qq.com")
+        || host == "aqqmusic.tc.qq.com"
+}
+
+fn parse_trusted_qqmusic_api_url(value: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "QQ 音乐地址无效 / Invalid QQ Music URL.".to_string())?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+        || !url
+            .host_str()
+            .map(is_trusted_qqmusic_api_host)
+            .unwrap_or(false)
+    {
+        return Err(
+            "仅允许 QQ 音乐官方 HTTPS 地址 / Only official QQ Music HTTPS endpoints are allowed."
+                .to_string(),
+        );
+    }
+    Ok(url)
+}
+
+fn parse_trusted_qqmusic_login_url(value: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "QQ 登录跳转地址无效 / Invalid QQ login redirect.".to_string())?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+        || !url
+            .host_str()
+            .map(is_trusted_qqmusic_login_host)
+            .unwrap_or(false)
+    {
+        return Err(
+            "已拒绝不受信任的 QQ 登录跳转 / Untrusted QQ login redirect was blocked.".to_string(),
+        );
+    }
+    Ok(url)
+}
+
+fn is_trusted_qqmusic_media_url(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .ok()
+        .filter(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && matches!(url.port_or_known_default(), Some(80 | 443))
+        })
+        .and_then(|url| url.host_str().map(is_trusted_qqmusic_media_host))
+        .unwrap_or(false)
+}
+
+pub fn validate_qqmusic_base_url(value: &str) -> Result<String, String> {
+    let mut url = parse_trusted_qqmusic_api_url(value.trim().trim_end_matches('/'))?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn qqmusic_api_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let trusted = attempt.url().scheme() == "https"
+                && attempt
+                    .url()
+                    .host_str()
+                    .map(is_trusted_qqmusic_api_host)
+                    .unwrap_or(false);
+            if !trusted {
+                attempt.stop()
+            } else if attempt.previous().len() >= 3 {
+                attempt.error("too many QQ Music redirects")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|error| format!("QQ 音乐网络客户端初始化失败 / QQ Music client failed: {error}"))
+}
 
 /// QQ 登录浏览器特征头 / QQ Login browser-like headers
 /// ptlogin2 服务器会检查这些头，缺失时返回 403 Forbidden（反自动化机制）。
@@ -105,11 +210,25 @@ pub struct ResolvedQQMusicSourceConfig {
 #[serde(rename_all = "camelCase")]
 pub struct QQMusicLoginStatusDto {
     pub logged_in: bool,
+    pub credential_present: bool,
+    pub status: QQMusicAuthState,
     pub uin: String,
     pub nickname: String,
     pub avatar_url: String,
     pub vip_type: String, // "none" | "green" | "super"
     pub message: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QQMusicAuthState {
+    SignedOut,
+    CredentialPresent,
+    Verifying,
+    Authenticated,
+    Expired,
+    Unknown,
+    Failed,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -197,7 +316,7 @@ fn extract_cookie_raw(cookie: &str, name: &str) -> Option<String> {
     for part in cookie.split(';') {
         let part = part.trim();
         if part.to_lowercase().starts_with(&prefix.to_lowercase()) {
-            if let Some(val) = part.split('=').nth(1) {
+            if let Some((_, val)) = part.split_once('=') {
                 let val = val.trim();
                 if !val.is_empty() {
                     return Some(val.to_string());
@@ -214,6 +333,39 @@ fn extract_cookie_raw(cookie: &str, name: &str) -> Option<String> {
 /// 优先 qm_keyst，回退到 qqmusic_key 以兼容旧 cookie。
 fn extract_qqmusic_signing_key(cookie: &str) -> Option<String> {
     extract_cookie_raw(cookie, "qm_keyst").or_else(|| extract_cookie_raw(cookie, "qqmusic_key"))
+}
+
+pub fn qqmusic_credential_is_complete(cookie: &str) -> bool {
+    let has_signing_key = extract_qqmusic_signing_key(cookie).is_some()
+        || extract_cookie_raw(cookie, "p_skey").is_some()
+        || extract_cookie_raw(cookie, "superkey").is_some();
+    let has_uin = ["uin", "pt2gguin", "superuin"]
+        .iter()
+        .any(|name| extract_cookie_raw(cookie, name).is_some());
+    has_signing_key && has_uin
+}
+
+pub fn classify_qqmusic_auth_failure(
+    error: &str,
+    credential_present: bool,
+    credential_complete: bool,
+) -> QQMusicAuthState {
+    if !credential_present {
+        return QQMusicAuthState::SignedOut;
+    }
+    if !credential_complete {
+        return QQMusicAuthState::Failed;
+    }
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("expired")
+        || normalized.contains("session_invalid")
+        || normalized.contains("登录过期")
+        || normalized.contains("会话过期")
+    {
+        QQMusicAuthState::Expired
+    } else {
+        QQMusicAuthState::Unknown
+    }
 }
 
 /// 从 config 中提取 g_tk 和 g_tk_new_20200303
@@ -246,11 +398,6 @@ fn resolve_qqmusic_gtk(config: &ResolvedQQMusicSourceConfig) -> (u32, u32) {
         .unwrap_or("");
     let g_tk = qqmusic_gtk(key_old);
 
-    eprintln!(
-        "[QQMusic] g_tk={g_tk}, g_tk_new_20200303={g_tk_new} (key_new_len={}, key_old_len={})",
-        key_new.len(),
-        key_old.len()
-    );
     (g_tk, g_tk_new)
 }
 
@@ -316,8 +463,9 @@ pub async fn request_qqmusic_text(
     query: &[(&str, &str)],
     extra_headers: Option<&HashMap<&str, String>>,
 ) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let mut req = client.get(url).query(query);
+    let client = qqmusic_api_client()?;
+    let trusted_url = parse_trusted_qqmusic_api_url(url)?;
+    let mut req = client.get(trusted_url).query(query);
 
     for (key, value) in qqmusic_default_headers() {
         req = req.header(key, value);
@@ -335,13 +483,19 @@ pub async fn request_qqmusic_text(
         .timeout(std::time::Duration::from_secs(12))
         .send()
         .await
-        .map_err(|e| format!("QQ音乐请求失败 / QQ Music request failed: {e}"))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                "timeout: QQ音乐请求超时 / QQ Music request timed out.".to_string()
+            } else {
+                "api_failed: QQ音乐请求失败 / QQ Music request failed.".to_string()
+            }
+        })?;
 
     let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|e| format!("QQ音乐响应读取失败 / Failed to read QQ Music response: {e}"))?;
+        .map_err(|_| "QQ音乐响应读取失败 / Failed to read QQ Music response.".to_string())?;
 
     if status == 412 || status == 503 {
         return Err(
@@ -363,7 +517,8 @@ pub async fn request_qqmusic_json_post(
     url: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::new();
+    let client = qqmusic_api_client()?;
+    let trusted_url = parse_trusted_qqmusic_api_url(url)?;
 
     let body_str = serde_json::to_string(body).unwrap_or_default();
 
@@ -374,8 +529,7 @@ pub async fn request_qqmusic_json_post(
     // The non-encrypted musicu.fcg endpoint only needs format and data;
     // extra params like g_tk/loginUin/hostUin cause some APIs to return 500005.
     let encoded_body = urlencoding::encode(&body_str);
-    let full_url = format!("{}?format=json&data={}", url, encoded_body);
-    eprintln!("[QQMusic] GET URL length: {}", full_url.len());
+    let full_url = format!("{}?format=json&data={}", trusted_url, encoded_body);
     let mut req = client.get(&full_url);
 
     req = req.header("Referer", "https://y.qq.com/");
@@ -396,26 +550,29 @@ pub async fn request_qqmusic_json_post(
         req = req.header("Cookie", cookie_full.as_str());
     }
 
-    eprintln!("[QQMusic] request URL: {}", url);
-    eprintln!("[QQMusic] request body: {}", safe_preview(&body_str, 500));
-
     let response = req
         .timeout(std::time::Duration::from_secs(12))
         .send()
         .await
-        .map_err(|e| format!("QQ音乐请求失败 / QQ Music request failed: {e}"))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                "timeout: QQ音乐请求超时 / QQ Music request timed out.".to_string()
+            } else {
+                "api_failed: QQ音乐请求失败 / QQ Music request failed.".to_string()
+            }
+        })?;
 
     let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|e| format!("QQ音乐响应读取失败 / Failed to read QQ Music response: {e}"))?;
+        .map_err(|_| "QQ音乐响应读取失败 / Failed to read QQ Music response.".to_string())?;
 
+    #[cfg(debug_assertions)]
     eprintln!(
-        "[QQMusic] response status: {status}, body length: {}",
+        "[QQMusic] API response: status={status}, body_length={}",
         text.len()
     );
-    eprintln!("[QQMusic] response body: {}", safe_preview(&text, 500));
 
     if status == 412 || status == 503 {
         return Err("rate_limited: 请求过于频繁，请稍后再试 / Rate limited.".to_string());
@@ -424,8 +581,12 @@ pub async fn request_qqmusic_json_post(
         return Err("QQ音乐需要网页验证 / QQ Music requires web verification.".to_string());
     }
 
-    serde_json::from_str::<serde_json::Value>(&text)
-        .map_err(|_| format!("QQ音乐 JSON 解析失败 / Failed to parse QQ Music JSON: {text}"))
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|_| {
+        format!(
+            "QQ音乐 JSON 解析失败 / Failed to parse QQ Music JSON (status={status}, body_length={})",
+            text.len()
+        )
+    })
 }
 
 /// 发送 QQ 音乐 API 请求（匿名，不发送 Cookie）
@@ -433,10 +594,11 @@ pub async fn request_qqmusic_json_post_anon(
     url: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::new();
+    let client = qqmusic_api_client()?;
+    let trusted_url = parse_trusted_qqmusic_api_url(url)?;
     let body_str = serde_json::to_string(body).unwrap_or_default();
     let encoded_body = urlencoding::encode(&body_str);
-    let full_url = format!("{}?format=json&data={}", url, encoded_body);
+    let full_url = format!("{}?format=json&data={}", trusted_url, encoded_body);
     let mut req = client.get(&full_url);
     req = req.header("Referer", "https://y.qq.com/");
     req = req.header("Origin", "https://y.qq.com");
@@ -447,19 +609,34 @@ pub async fn request_qqmusic_json_post_anon(
         .timeout(std::time::Duration::from_secs(12))
         .send()
         .await
-        .map_err(|e| format!("QQ音乐请求失败 / QQ Music request failed: {e}"))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                "timeout: QQ音乐请求超时 / QQ Music request timed out.".to_string()
+            } else {
+                "api_failed: QQ音乐请求失败 / QQ Music request failed.".to_string()
+            }
+        })?;
 
+    let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|e| format!("QQ音乐响应读取失败 / Failed to read QQ Music response: {e}"))?;
+        .map_err(|_| "QQ音乐响应读取失败 / Failed to read QQ Music response.".to_string())?;
+
+    if status == 412 || status == 503 {
+        return Err("rate_limited: 请求过于频繁，请稍后再试 / Rate limited.".to_string());
+    }
 
     if text.trim_start().starts_with("<!DOCTYPE") || text.trim_start().starts_with("<html") {
         return Err("QQ音乐需要网页验证 / QQ Music requires web verification.".to_string());
     }
 
-    serde_json::from_str::<serde_json::Value>(&text)
-        .map_err(|_| format!("QQ音乐 JSON 解析失败 / Failed to parse QQ Music JSON: {text}"))
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|_| {
+        format!(
+            "QQ音乐 JSON 解析失败 / Failed to parse QQ Music JSON (status={status}, body_length={})",
+            text.len()
+        )
+    })
 }
 
 // ── 封面 URL 构造 ────────────────────────────────────────────────────
@@ -797,7 +974,8 @@ pub async fn fetch_qqmusic_playable_url(
             }
         });
 
-        eprintln!("[QQMusic] playback: trying quality={q}, filename={filename}, songmid={songmid}, uin={uin}");
+        #[cfg(debug_assertions)]
+        eprintln!("[QQMusic] playback attempt: quality={q}");
 
         let result =
             request_qqmusic_json_post(config, "https://u.y.qq.com/cgi-bin/musicu.fcg", &body).await;
@@ -810,12 +988,6 @@ pub async fn fetch_qqmusic_playable_url(
                     .and_then(|c| c.as_i64())
                     .unwrap_or(-1);
                 eprintln!("[QQMusic] playback quality={q}: req_1.code={req_code}");
-                let resp_str = serde_json::to_string(&value).unwrap_or_default();
-                eprintln!(
-                    "[QQMusic] playback 完整响应: {}",
-                    safe_preview(&resp_str, 500)
-                );
-
                 if req_code != 0 {
                     _last_error = Some(format!("req_1.code={req_code}"));
                     last_reason = if req_code == 500005 {
@@ -870,62 +1042,6 @@ pub async fn fetch_qqmusic_playable_url(
                         continue;
                     }
 
-                    // 提取 testfile2g 用于 CDN 连通性诊断（不加入候选列表，仅日志）
-                    // Extract testfile2g for CDN connectivity diagnosis (log only, not added to candidates)
-                    if let Some(testfile) = data
-                        .get("testfile2g")
-                        .and_then(|t| t.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        let testfile_clean: String = testfile
-                            .chars()
-                            .filter(|c| {
-                                c.is_ascii()
-                                    && (c.is_ascii_alphanumeric()
-                                        || *c == '.'
-                                        || *c == ':'
-                                        || *c == '/'
-                                        || *c == '?'
-                                        || *c == '='
-                                        || *c == '&'
-                                        || *c == '-'
-                                        || *c == '_'
-                                        || *c == '%')
-                            })
-                            .collect();
-                        if !testfile_clean.is_empty() {
-                            let sip_for_test = data
-                                .get("sip")
-                                .and_then(|s| s.as_array())
-                                .and_then(|arr| arr.first())
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("http://aqqmusic.tc.qq.com");
-                            let sip_clean_test: String = sip_for_test
-                                .chars()
-                                .filter(|c| {
-                                    c.is_ascii()
-                                        && (c.is_ascii_alphanumeric()
-                                            || *c == '.'
-                                            || *c == ':'
-                                            || *c == '/'
-                                            || *c == '-'
-                                            || *c == '_')
-                                })
-                                .collect::<String>()
-                                .trim_end_matches('/')
-                                .to_string();
-                            let test_url = format!(
-                                "{}/{}",
-                                sip_clean_test,
-                                testfile_clean.trim_start_matches('/')
-                            );
-                            eprintln!(
-                                "[QQMusic] playback: CDN 连通性诊断(不播放) testfile={}",
-                                safe_preview(&test_url, 120)
-                            );
-                        }
-                    }
-
                     // 收集 API 返回的所有 sip（CDN 地址）
                     // Collect all sip entries (CDN addresses) returned by API
                     let sip_array: Vec<String> = data
@@ -954,8 +1070,6 @@ pub async fn fetch_qqmusic_playable_url(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    eprintln!("[QQMusic] playback quality={q}: all sips={:?}", sip_array);
-
                     // purl 清理：只保留 ASCII URL 字符
                     // purl cleaning: keep only ASCII URL chars
                     let mut purl_clean: String = purl
@@ -985,21 +1099,13 @@ pub async fn fetch_qqmusic_playable_url(
                         purl_clean = clear_uin_param(&purl_clean);
                         eprintln!("[QQMusic] playback quality={q}: data.uin为空，已清空purl中的uin参数以匹配匿名vkey");
                     }
-                    eprintln!(
-                        "[QQMusic] playback quality={q}: cleaned purl (len={}): {:?}",
-                        purl_clean.len(),
-                        purl_clean
-                    );
-
                     // 构建播放 URL：对每个 sip 都生成一个 URL
                     // Build URL for each sip
                     if purl_clean.starts_with("http") {
                         // purl 已是完整 URL（旧格式）
-                        eprintln!(
-                            "[QQMusic] playback: ✅ quality={q} URL(purl自带)={}",
-                            safe_preview(&purl_clean, 100)
-                        );
-                        if !collected_urls.contains(&purl_clean) {
+                        if is_trusted_qqmusic_media_url(&purl_clean)
+                            && !collected_urls.contains(&purl_clean)
+                        {
                             collected_urls.push(purl_clean);
                         }
                     } else if !sip_array.is_empty() {
@@ -1011,12 +1117,8 @@ pub async fn fetch_qqmusic_playable_url(
                         };
                         for sip in &sip_array {
                             let url = format!("{}{}", sip, purl_with_slash);
-                            eprintln!(
-                                "[QQMusic] playback: ✅ quality={q} URL(sip={})={}",
-                                safe_preview(sip, 40),
-                                safe_preview(&url, 100)
-                            );
-                            if !collected_urls.contains(&url) {
+                            if is_trusted_qqmusic_media_url(&url) && !collected_urls.contains(&url)
+                            {
                                 collected_urls.push(url);
                             }
                         }
@@ -1026,11 +1128,7 @@ pub async fn fetch_qqmusic_playable_url(
                             "http://ws.stream.qqmusic.qq.com/{}",
                             purl_clean.trim_start_matches('/')
                         );
-                        eprintln!(
-                            "[QQMusic] playback: ✅ quality={q} URL(default)={}",
-                            safe_preview(&url, 100)
-                        );
-                        if !collected_urls.contains(&url) {
+                        if is_trusted_qqmusic_media_url(&url) && !collected_urls.contains(&url) {
                             collected_urls.push(url);
                         }
                     }
@@ -1065,10 +1163,11 @@ pub async fn fetch_qqmusic_playable_url(
                         } else {
                             continue;
                         };
-                        if !collected_urls.contains(&alt) {
+                        if is_trusted_qqmusic_media_url(&alt) && !collected_urls.contains(&alt) {
                             collected_urls.push(alt);
                         }
                     }
+                    collected_urls.truncate(QQMUSIC_MAX_MEDIA_CANDIDATES);
                     eprintln!(
                         "[QQMusic] playback: 已收集 {} 个候选 URL",
                         collected_urls.len()
@@ -1167,7 +1266,8 @@ pub async fn fetch_qqmusic_playable_url(
                 }
             });
 
-            eprintln!("[QQMusic] playback: 尝试匿名访问 {q} 音质 (filename={filename})...");
+            #[cfg(debug_assertions)]
+            eprintln!("[QQMusic] anonymous playback attempt: quality={q}");
             let result_anon =
                 request_qqmusic_json_post_anon("https://u.y.qq.com/cgi-bin/musicu.fcg", &body_anon)
                     .await;
@@ -1254,7 +1354,12 @@ pub async fn fetch_qqmusic_playable_url(
                             eprintln!(
                                 "[QQMusic] playback: ✅ 匿名访问 {q} 成功获取播放链接，加入候选"
                             );
-                            collected_urls.push(url);
+                            if is_trusted_qqmusic_media_url(&url)
+                                && !collected_urls.contains(&url)
+                                && collected_urls.len() < QQMUSIC_MAX_MEDIA_CANDIDATES
+                            {
+                                collected_urls.push(url);
+                            }
                         }
                     }
                 }
@@ -1518,8 +1623,14 @@ pub fn proxy_qqmusic_search_covers(
         .iter_mut()
         .filter(|s| s.source.as_deref() == Some("qqmusic"))
     {
-        if is_proxyable_remote_url(&song.cover_url) {
+        if is_proxyable_remote_url(&song.cover_url) && is_trusted_qqmusic_media_url(&song.cover_url)
+        {
             song.cover_url = register_media_proxy(state, &song.cover_url, "image")?;
+        } else if !song.cover_url.is_empty()
+            && !song.cover_url.starts_with("ome-media:")
+            && !song.cover_url.contains("ome-media.localhost")
+        {
+            song.cover_url.clear();
         }
     }
     Ok(())
@@ -1531,8 +1642,15 @@ pub fn proxy_qqmusic_track_covers(
     tracks: &mut [crate::TrackDto],
 ) -> Result<(), String> {
     for track in tracks.iter_mut().filter(|t| t.source == "qqmusic") {
-        if is_proxyable_remote_url(&track.cover_url) {
+        if is_proxyable_remote_url(&track.cover_url)
+            && is_trusted_qqmusic_media_url(&track.cover_url)
+        {
             track.cover_url = register_media_proxy(state, &track.cover_url, "image")?;
+        } else if !track.cover_url.is_empty()
+            && !track.cover_url.starts_with("ome-media:")
+            && !track.cover_url.contains("ome-media.localhost")
+        {
+            track.cover_url.clear();
         }
     }
     Ok(())
@@ -1545,9 +1663,20 @@ pub fn proxy_qqmusic_playback(
 ) -> Result<(), String> {
     let mut candidates: Vec<String> = Vec::new();
     if let Some(ref url) = playback.url {
-        candidates.push(url.clone());
+        if is_trusted_qqmusic_media_url(url) {
+            candidates.push(url.clone());
+        }
     }
-    candidates.extend(playback.audio_candidates.iter().cloned());
+    candidates.extend(
+        playback
+            .audio_candidates
+            .iter()
+            .filter(|url| is_trusted_qqmusic_media_url(url))
+            .cloned(),
+    );
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(QQMUSIC_MAX_MEDIA_CANDIDATES);
 
     if candidates.is_empty() {
         if !playback.unavailable {
@@ -1599,7 +1728,8 @@ pub fn load_qqmusic_source_config(db: &Connection) -> Result<QQMusicSourceConfig
     Ok(match stored {
         Some((enabled, base_url)) => QQMusicSourceConfigDto {
             enabled,
-            base_url,
+            base_url: validate_qqmusic_base_url(&base_url)
+                .unwrap_or_else(|_| QQMUSIC_DEFAULT_BASE_URL.to_string()),
             has_token,
             masked_token,
         },
@@ -1616,14 +1746,13 @@ pub fn save_qqmusic_source_config_to_db(
     db: &Connection,
     payload: SaveQQMusicSourceConfigPayload,
 ) -> Result<(), String> {
-    let base_url = payload
+    let requested_base_url = payload
         .base_url
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .unwrap_or(QQMUSIC_DEFAULT_BASE_URL)
-        .trim_end_matches('/')
-        .to_string();
+        .unwrap_or(QQMUSIC_DEFAULT_BASE_URL);
+    let base_url = validate_qqmusic_base_url(requested_base_url)?;
 
     if let Some(token) = payload
         .token
@@ -1683,46 +1812,35 @@ pub fn ensure_qqmusic_source_enabled(db: &Connection) -> Result<(), String> {
 
 // ── 测试连接 ──────────────────────────────────────────────────────────
 
-/// 诊断：返回 cookie 和提取值的详细信息
+/// 仅供测试的脱敏诊断。正式构建不注册对应 Tauri command。
+/// Redacted diagnostics for tests only; no production Tauri command is registered.
+#[cfg(test)]
 pub fn debug_dump_qqmusic(db: &Connection) -> serde_json::Value {
     let config = load_qqmusic_source_config(db);
     let token = read_qqmusic_token();
+    redacted_qqmusic_credential_metadata(
+        config.as_ref().map(|value| value.enabled).unwrap_or(false),
+        token.as_deref(),
+    )
+}
 
-    let cookie_str = token.as_deref().unwrap_or("");
-    let uin_str = resolve_qqmusic_uin(&ResolvedQQMusicSourceConfig {
-        enabled: true,
-        base_url: String::new(),
-        token: token.clone(),
-    });
-    let uin_num = resolve_qqmusic_uin_num(&ResolvedQQMusicSourceConfig {
-        enabled: true,
-        base_url: String::new(),
-        token: token.clone(),
-    });
-    let (g_tk, g_tk_new) = resolve_qqmusic_gtk(&ResolvedQQMusicSourceConfig {
-        enabled: true,
-        base_url: String::new(),
-        token: token.clone(),
-    });
-    let qqmusic_key = extract_qqmusic_signing_key(cookie_str).unwrap_or_default();
-    let p_skey = extract_cookie_raw(cookie_str, "p_skey").unwrap_or_default();
-    let superkey = extract_cookie_raw(cookie_str, "superkey").unwrap_or_default();
+#[cfg(test)]
+fn redacted_qqmusic_credential_metadata(
+    config_enabled: bool,
+    token: Option<&str>,
+) -> serde_json::Value {
+    let cookie_str = token.unwrap_or("");
 
     serde_json::json!({
-        "config_enabled": config.as_ref().map(|c| c.enabled).unwrap_or(false),
+        "config_enabled": config_enabled,
         "token_exists": token.is_some(),
         "token_length": cookie_str.len(),
         "contains_qqmusic_key": cookie_str.contains("qqmusic_key="),
+        "contains_qm_keyst": cookie_str.contains("qm_keyst="),
         "contains_uin": cookie_str.contains("uin="),
         "contains_pt2gguin": cookie_str.contains("pt2gguin="),
         "contains_p_skey": cookie_str.contains("p_skey="),
-        "uin_str": uin_str,
-        "uin_num": uin_num,
-        "g_tk": g_tk,
-        "g_tk_new": g_tk_new,
-        "qqmusic_key_length": qqmusic_key.len(),
-        "p_skey_length": p_skey.len(),
-        "superkey_length": superkey.len(),
+        "contains_superkey": cookie_str.contains("superkey="),
     })
 }
 
@@ -1765,9 +1883,12 @@ pub async fn verify_qqmusic_session(
     let uin_str = resolve_qqmusic_uin(config);
     let uin_num = resolve_qqmusic_uin_num(config);
     let cookie_str = config.token.as_deref().unwrap_or("");
+    #[cfg(debug_assertions)]
     eprintln!(
-        "[QQMusic] verify_session: uin_str={uin_str}, uin_num={uin_num}, cookie len={}",
-        cookie_str.len()
+        "[QQMusic] session verification metadata: credential_length={}, has_uin={}, has_signing_key={}",
+        cookie_str.len(),
+        uin_num > 0,
+        extract_qqmusic_signing_key(cookie_str).is_some()
     );
     eprintln!(
         "[QQMusic] verify_session: 含 qqmusic_key={}",
@@ -1806,12 +1927,6 @@ pub async fn verify_qqmusic_session(
 
     match &result1 {
         Ok(value) => {
-            let resp_summary = serde_json::to_string(value).unwrap_or_default();
-            eprintln!(
-                "[QQMusic] verify_session 方式1 API响应: {}",
-                &resp_summary[..resp_summary.len().min(500)]
-            );
-
             // 检查 req_1.code 是否为 0
             let req_code = value
                 .get("req_1")
@@ -1831,7 +1946,8 @@ pub async fn verify_qqmusic_session(
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "QQ音乐用户".to_string());
 
-                eprintln!("[QQMusic] verify_session 方式1成功, nickname={nickname}");
+                #[cfg(debug_assertions)]
+                eprintln!("[QQMusic] session verification succeeded via user info");
                 return Ok((uin_str, nickname));
             }
             eprintln!("[QQMusic] verify_session 方式1 req_1.code={req_code}，尝试方式2...");
@@ -1858,12 +1974,6 @@ pub async fn verify_qqmusic_session(
 
     match &result2 {
         Ok(value) => {
-            let resp_summary = serde_json::to_string(value).unwrap_or_default();
-            eprintln!(
-                "[QQMusic] verify_session 方式2 API响应: {}",
-                &resp_summary[..resp_summary.len().min(500)]
-            );
-
             let req_code = value
                 .get("req_1")
                 .and_then(|r| r.get("code"))
@@ -1899,11 +2009,6 @@ pub async fn verify_qqmusic_session(
 
     match &result3 {
         Ok(value) => {
-            let resp_summary = serde_json::to_string(value).unwrap_or_default();
-            eprintln!(
-                "[QQMusic] verify_session 方式3 API响应: {}",
-                &resp_summary[..resp_summary.len().min(500)]
-            );
             let req_code = value
                 .get("req_1")
                 .and_then(|r| r.get("code"))
@@ -1917,15 +2022,9 @@ pub async fn verify_qqmusic_session(
                     .and_then(|d| d.get("user_baseinfo"))
                     .and_then(|u| u.get("nick"))
                     .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                let avatar_url = value
-                    .get("req_1")
-                    .and_then(|r| r.get("data"))
-                    .and_then(|d| d.get("user_baseinfo"))
-                    .and_then(|u| u.get("pic"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                return Ok((nickname.to_string(), avatar_url.to_string()));
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("QQ音乐用户");
+                return Ok((uin_str, nickname.to_string()));
             }
             eprintln!("[QQMusic] verify_session 方式3 req_1.code={}", req_code);
         }
@@ -1934,9 +2033,7 @@ pub async fn verify_qqmusic_session(
         }
     }
 
-    Err(format!(
-        "QQ音乐验证失败(uin={uin_str})，所有验证方式均失败 / All verification methods failed."
-    ))
+    Err("QQ音乐验证失败，所有验证方式均失败 / All verification methods failed.".to_string())
 }
 
 // ── QR 登录 ──────────────────────────────────────────────────────────
@@ -2117,8 +2214,15 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
             .unwrap_or("")
             .to_string();
 
-        eprintln!("[QQMusic] ptqrlogin 302 重定向: location={redirect_url}");
-        eprintln!("[QQMusic] ptqrlogin Set-Cookie: {ptqrlogin_cookies}");
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[QQMusic] QR login redirect: status={}, cookie_count={}",
+            resp_status,
+            ptqrlogin_cookies
+                .split(';')
+                .filter(|part| !part.trim().is_empty())
+                .count()
+        );
 
         if !redirect_url.is_empty() {
             // 302 重定向 = 登录成功，跟随重定向链获取完整 cookie
@@ -2140,13 +2244,12 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
             }
             let merged_cookie = all_parts.join("; ");
 
+            #[cfg(debug_assertions)]
             eprintln!(
-                "[QQMusic] 最终 cookie uin 提取测试: {:?}",
-                extract_cookie_value(&merged_cookie)
-            );
-            eprintln!(
-                "[QQMusic] 最终 cookie (前500字符): {}",
-                &merged_cookie[..merged_cookie.len().min(500)]
+                "[QQMusic] QR login confirmed: credential_length={}, has_uin={}, has_signing_key={}",
+                merged_cookie.len(),
+                extract_cookie_value(&merged_cookie).is_some(),
+                extract_qqmusic_signing_key(&merged_cookie).is_some()
             );
 
             return Ok(QQMusicQrCheckDto {
@@ -2168,11 +2271,10 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
         .await
         .map_err(|e| format!("QQ登录响应读取失败: {e}"))?;
 
-    // 调试 / Debug: 打印 ptqrlogin 原始响应，便于诊断扫码无反应问题
-    eprintln!("[QQMusic] ptqrlogin HTTP status: {resp_status}");
+    #[cfg(debug_assertions)]
     eprintln!(
-        "[QQMusic] ptqrlogin 原始响应 (前500字符): {}",
-        &text[..text.len().min(500)]
+        "[QQMusic] QR poll response: status={resp_status}, body_length={}",
+        text.len()
     );
     eprintln!(
         "[QQMusic] ptqrlogin cookie传入: qrsig_len={}, all_cookies_len={}",
@@ -2220,11 +2322,14 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
         });
     }
     if has_0 {
+        #[cfg(debug_assertions)]
         eprintln!(
-            "[QQMusic] ptqrlogin 200 成功: {}",
-            &text[..text.len().min(300)]
+            "[QQMusic] QR login callback confirmed: cookie_count={}",
+            ptqrlogin_cookies
+                .split(';')
+                .filter(|part| !part.trim().is_empty())
+                .count()
         );
-        eprintln!("[QQMusic] ptqrlogin Set-Cookie: {ptqrlogin_cookies}");
 
         // 登录成功 → 合并 ptqrlogin 响应 cookie + 跟随重定向获取的 cookie
         let redirect_cookie =
@@ -2244,13 +2349,12 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
         }
         let merged_cookie = all_parts.join("; ");
 
+        #[cfg(debug_assertions)]
         eprintln!(
-            "[QQMusic] 最终 cookie uin 提取测试: {:?}",
-            extract_cookie_value(&merged_cookie)
-        );
-        eprintln!(
-            "[QQMusic] 最终 cookie (前500字符): {}",
-            &merged_cookie[..merged_cookie.len().min(500)]
+            "[QQMusic] QR login confirmed: credential_length={}, has_uin={}, has_signing_key={}",
+            merged_cookie.len(),
+            extract_cookie_value(&merged_cookie).is_some(),
+            extract_qqmusic_signing_key(&merged_cookie).is_some()
         );
 
         return Ok(QQMusicQrCheckDto {
@@ -2264,7 +2368,9 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
     Ok(QQMusicQrCheckDto {
         status: "waiting".to_string(),
         cookie: None,
-        message: Some(format!("未知登录状态，继续等待: {text}")),
+        message: Some(
+            "登录状态暂时未知，继续等待 / Login status unknown; still waiting.".to_string(),
+        ),
     })
 }
 
@@ -2292,8 +2398,6 @@ async fn follow_qqmusic_login_redirect(
             .to_string()
     };
 
-    eprintln!("[QQMusic] 重定向 URL: {redirect_url}");
-
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -2312,18 +2416,24 @@ async fn follow_qqmusic_login_redirect(
     }
 
     // 手动跟随重定向链，最多 10 跳
-    let mut current_url = redirect_url.to_string();
+    let mut current_url = parse_trusted_qqmusic_login_url(&redirect_url)?;
     for _hop in 0..10u32 {
         let cookie_header = accumulated.join("; ");
         let resp = client
-            .get(&current_url)
+            .get(current_url.clone())
             .header("User-Agent", QQMUSIC_UA)
             .header("Referer", "https://y.qq.com/")
             .header("Cookie", &cookie_header)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| format!("登录重定向请求失败(hop {_hop}): {e}"))?;
+            .map_err(|error| {
+                if error.is_timeout() {
+                    "QQ 登录跳转超时 / QQ login redirect timed out.".to_string()
+                } else {
+                    "QQ 登录跳转失败 / QQ login redirect failed.".to_string()
+                }
+            })?;
 
         // 收集本跳的 Set-Cookie
         for v in resp.headers().get_all("set-cookie").iter() {
@@ -2354,55 +2464,22 @@ async fn follow_qqmusic_login_redirect(
             set_cookie_count,
             accumulated.len()
         );
-        if set_cookie_count > 0 {
-            for v in resp.headers().get_all("set-cookie").iter() {
-                if let Ok(s) = v.to_str() {
-                    eprintln!(
-                        "[QQMusic]   hop {_hop} Set-Cookie: {}",
-                        &s[..s.len().min(200)]
-                    );
-                }
-            }
-        }
-
         // 检查是否为重定向
         if resp.status().is_redirection() {
             if let Some(loc) = resp.headers().get("location") {
                 let next_url = loc.to_str().unwrap_or("");
-                eprintln!(
-                    "[QQMusic] hop {_hop} Location: {}",
-                    &next_url[..next_url.len().min(1000)]
-                );
                 if next_url.is_empty() {
                     break;
                 }
-                // 处理相对 URL
-                current_url = if next_url.starts_with("http") {
-                    next_url.to_string()
-                } else if next_url.starts_with('/') {
-                    // 从当前 URL 提取 origin
-                    let origin = current_url.split('/').take(3).collect::<Vec<_>>().join("/");
-                    format!("{origin}{next_url}")
-                } else {
-                    next_url.to_string()
-                };
+                let resolved = current_url
+                    .join(next_url)
+                    .map_err(|_| "QQ 登录跳转地址无效 / Invalid QQ login redirect.".to_string())?;
+                current_url = parse_trusted_qqmusic_login_url(resolved.as_str())?;
                 continue;
             }
         }
         // 非重定向响应（200 OK），尝试从 HTML 中提取跳转 URL
         let body = resp.text().await.unwrap_or_default();
-        let body_preview = &body[..body.len().min(2000)];
-        eprintln!("[QQMusic] hop {} 200 body(前2000): {}", _hop, body_preview);
-        if body.contains("postMessage") || body.contains("qclogin") {
-            eprintln!("[QQMusic] hop {} 发现 postMessage/qclogin!", _hop);
-            for kw in &["postMessage", "qclogin", "access_token", "code="] {
-                if let Some(pos) = body.find(kw) {
-                    let s = pos.saturating_sub(100);
-                    let e = (pos + 200).min(body.len());
-                    eprintln!("[QQMusic] hop {} '{}' ctx: {}", _hop, kw, &body[s..e]);
-                }
-            }
-        }
 
         let mut found_url: Option<String> = None;
 
@@ -2414,12 +2491,7 @@ async fn follow_qqmusic_login_redirect(
                 .find(['"', '\'', '>', ';'])
                 .unwrap_or(after.len().min(500));
             let extracted = &after[..end];
-            if extracted.starts_with("http") {
-                eprintln!(
-                    "[QQMusic] hop {} HTML跳转URL: {}",
-                    _hop,
-                    &extracted[..extracted.len().min(300)]
-                );
+            if parse_trusted_qqmusic_login_url(extracted).is_ok() {
                 found_url = Some(extracted.to_string());
             }
         }
@@ -2442,12 +2514,7 @@ async fn follow_qqmusic_login_redirect(
                     .find(['"', '\'', ')', ';'])
                     .unwrap_or(after.len().min(500));
                 let extracted = &after[..end];
-                if extracted.starts_with("http") {
-                    eprintln!(
-                        "[QQMusic] hop {} JS跳转URL: {}",
-                        _hop,
-                        &extracted[..extracted.len().min(300)]
-                    );
+                if parse_trusted_qqmusic_login_url(extracted).is_ok() {
                     found_url = Some(extracted.to_string());
                     break;
                 }
@@ -2455,7 +2522,7 @@ async fn follow_qqmusic_login_redirect(
         }
 
         if let Some(next_url) = found_url {
-            current_url = next_url;
+            current_url = parse_trusted_qqmusic_login_url(&next_url)?;
             continue;
         }
 
@@ -2464,18 +2531,24 @@ async fn follow_qqmusic_login_redirect(
 
     // 访问 y.qq.com 获取 QQ 音乐专用 cookie（如 qqmusic_key, qt 等）
     // 手动跟随重定向链（最多 5 跳），因为 qqmusic_key 可能在重定向中设置
-    let mut yqq_url = "https://y.qq.com/".to_string();
+    let mut yqq_url = parse_trusted_qqmusic_login_url("https://y.qq.com/")?;
     for _yhop in 0..5u32 {
         let cookie_header = accumulated.join("; ");
         let resp_y = client
-            .get(&yqq_url)
+            .get(yqq_url.clone())
             .header("User-Agent", QQMUSIC_UA)
             .header("Referer", "https://y.qq.com/")
             .header("Cookie", &cookie_header)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| format!("Cookie fetch from y.qq.com failed(hop {_yhop}): {e}"))?;
+            .map_err(|error| {
+                if error.is_timeout() {
+                    "QQ 音乐会话确认超时 / QQ Music session check timed out.".to_string()
+                } else {
+                    "QQ 音乐会话确认失败 / QQ Music session check failed.".to_string()
+                }
+            })?;
 
         let y_set_cookie_count = resp_y.headers().get_all("set-cookie").iter().count();
         eprintln!(
@@ -2486,10 +2559,6 @@ async fn follow_qqmusic_login_redirect(
 
         for v in resp_y.headers().get_all("set-cookie").iter() {
             if let Ok(s) = v.to_str() {
-                eprintln!(
-                    "[QQMusic]   y.qq.com hop {_yhop} Set-Cookie: {}",
-                    &s[..s.len().min(200)]
-                );
                 if let Some(name_value) = s.split(';').next() {
                     let name_value = name_value.trim();
                     if !name_value.is_empty() {
@@ -2508,31 +2577,18 @@ async fn follow_qqmusic_login_redirect(
         if resp_y.status().is_redirection() {
             if let Some(loc) = resp_y.headers().get("location") {
                 let next_url = loc.to_str().unwrap_or("");
-                eprintln!(
-                    "[QQMusic] y.qq.com hop {_yhop} Location: {}",
-                    &next_url[..next_url.len().min(200)]
-                );
                 if next_url.is_empty() {
                     break;
                 }
-                yqq_url = if next_url.starts_with("http") {
-                    next_url.to_string()
-                } else if next_url.starts_with('/') {
-                    let origin = yqq_url.split('/').take(3).collect::<Vec<_>>().join("/");
-                    format!("{origin}{next_url}")
-                } else {
-                    next_url.to_string()
-                };
+                let resolved = yqq_url.join(next_url).map_err(|_| {
+                    "QQ 音乐会话跳转地址无效 / Invalid QQ Music session redirect.".to_string()
+                })?;
+                yqq_url = parse_trusted_qqmusic_login_url(resolved.as_str())?;
                 continue;
             }
         }
         // 200 OK: 尝试从 HTML 中提取跳转 URL
         let y_body = resp_y.text().await.unwrap_or_default();
-        let y_body_preview = &y_body[..y_body.len().min(2000)];
-        eprintln!(
-            "[QQMusic] y.qq.com hop {_yhop} 200 body(前500): {}",
-            y_body_preview
-        );
 
         let mut y_found_url: Option<String> = None;
         for pattern in &[
@@ -2552,11 +2608,7 @@ async fn follow_qqmusic_login_redirect(
                     .find(['"', '\'', ')', ';'])
                     .unwrap_or(after.len().min(500));
                 let extracted = &after[..end];
-                if extracted.starts_with("http") {
-                    eprintln!(
-                        "[QQMusic] y.qq.com hop {_yhop} JS跳转URL: {}",
-                        &extracted[..extracted.len().min(300)]
-                    );
+                if parse_trusted_qqmusic_login_url(extracted).is_ok() {
                     y_found_url = Some(extracted.to_string());
                     break;
                 }
@@ -2570,17 +2622,13 @@ async fn follow_qqmusic_login_redirect(
                     .find(['"', '\'', '>', ';'])
                     .unwrap_or(after.len().min(500));
                 let extracted = &after[..end];
-                if extracted.starts_with("http") {
-                    eprintln!(
-                        "[QQMusic] y.qq.com hop {_yhop} HTML跳转URL: {}",
-                        &extracted[..extracted.len().min(300)]
-                    );
+                if parse_trusted_qqmusic_login_url(extracted).is_ok() {
                     y_found_url = Some(extracted.to_string());
                 }
             }
         }
         if let Some(next_url) = y_found_url {
-            yqq_url = next_url;
+            yqq_url = parse_trusted_qqmusic_login_url(&next_url)?;
             continue;
         }
         break;
@@ -2590,7 +2638,6 @@ async fn follow_qqmusic_login_redirect(
     // 尝试调用 fcg_music_oauth_get_accesstoken.fcg 用 QQ Connect cookie 换取 qqmusic_key
     let has_qqmusic_key = accumulated.iter().any(|a| a.starts_with("qqmusic_key="));
     if !has_qqmusic_key {
-        eprintln!("[QQMusic] 尝试 fcg_music_oauth_get_accesstoken.fcg 端点...");
         let cookie_str = accumulated.join("; ");
         // 尝试多种参数组合
         let oauth_urls = vec![
@@ -2609,9 +2656,10 @@ async fn follow_qqmusic_login_redirect(
             if let Ok(or) = oauth_resp {
                 let or_status = or.status();
                 let or_text = or.text().await.unwrap_or_default();
+                #[cfg(debug_assertions)]
                 eprintln!(
-                    "[QQMusic] oauth_get_accesstoken: status={or_status}, body={}",
-                    &or_text[..or_text.len().min(500)]
+                    "[QQMusic] OAuth response: status={or_status}, body_length={}",
+                    or_text.len()
                 );
                 // 尝试从响应中提取 access_token 或 musickey
                 if or_text.contains("access_token")
@@ -2627,11 +2675,6 @@ async fn follow_qqmusic_login_redirect(
                                 .and_then(|v| v.as_str())
                                 .filter(|s| !s.is_empty())
                             {
-                                eprintln!(
-                                    "[QQMusic] 从 oauth 端点获取 {} = {}...",
-                                    field,
-                                    &val[..val.len().min(20)]
-                                );
                                 accumulated.retain(|a| !a.starts_with("qqmusic_key="));
                                 accumulated.push(format!("qqmusic_key={}", val));
                                 break;
@@ -2647,11 +2690,6 @@ async fn follow_qqmusic_login_redirect(
                                     .and_then(|v| v.as_str())
                                     .filter(|s| !s.is_empty())
                                 {
-                                    eprintln!(
-                                        "[QQMusic] 从 oauth data 获取 {} = {}...",
-                                        field,
-                                        &val[..val.len().min(20)]
-                                    );
                                     accumulated.retain(|a| !a.starts_with("qqmusic_key="));
                                     accumulated.push(format!("qqmusic_key={}", val));
                                     break;
@@ -2667,7 +2705,6 @@ async fn follow_qqmusic_login_redirect(
     // 也尝试 POST 方式调用 fcg_music_oauth_get_accesstoken.fcg
     let has_qqmusic_key = accumulated.iter().any(|a| a.starts_with("qqmusic_key="));
     if !has_qqmusic_key {
-        eprintln!("[QQMusic] 尝试 POST fcg_music_oauth_get_accesstoken.fcg...");
         let cookie_str = accumulated.join("; ");
         let oauth_body = serde_json::json!({
             "comm": build_qqmusic_comm(&ResolvedQQMusicSourceConfig {
@@ -2694,9 +2731,10 @@ async fn follow_qqmusic_login_redirect(
         if let Ok(opr) = oauth_post_resp {
             let opr_status = opr.status();
             let opr_text = opr.text().await.unwrap_or_default();
+            #[cfg(debug_assertions)]
             eprintln!(
-                "[QQMusic] GetLoginInfo: status={opr_status}, body={}",
-                &opr_text[..opr_text.len().min(500)]
+                "[QQMusic] login-info response: status={opr_status}, body_length={}",
+                opr_text.len()
             );
         }
     }
@@ -2711,14 +2749,12 @@ async fn follow_qqmusic_login_redirect(
         // 2. superkey - QQ登录 superkey
         // 3. p_skey - QQ Connect p_skey
         let mut fallback_key: Option<String> = None;
-        let mut fallback_source = "";
 
         for a in accumulated.iter() {
             if a.starts_with("pt_oauth_token=") {
                 let val = a.strip_prefix("pt_oauth_token=").unwrap_or("");
                 if !val.is_empty() {
                     fallback_key = Some(val.to_string());
-                    fallback_source = "pt_oauth_token";
                     break;
                 }
             }
@@ -2730,7 +2766,6 @@ async fn follow_qqmusic_login_redirect(
                     let val = a.strip_prefix("superkey=").unwrap_or("");
                     if !val.is_empty() {
                         fallback_key = Some(val.to_string());
-                        fallback_source = "superkey";
                         break;
                     }
                 }
@@ -2743,7 +2778,6 @@ async fn follow_qqmusic_login_redirect(
                     let val = a.strip_prefix("p_skey=").unwrap_or("");
                     if !val.is_empty() {
                         fallback_key = Some(val.to_string());
-                        fallback_source = "p_skey";
                         break;
                     }
                 }
@@ -2751,7 +2785,6 @@ async fn follow_qqmusic_login_redirect(
         }
 
         if let Some(key_val) = fallback_key {
-            eprintln!("[QQMusic] 尝试用 {} 作为 qqmusic_key 替代", fallback_source);
             accumulated.push(format!("qqmusic_key={}", key_val));
         }
     }
@@ -2760,13 +2793,12 @@ async fn follow_qqmusic_login_redirect(
         let cookie_header = accumulated.join("; ");
 
         // 方式A: 尝试调用 QQ Connect authorize 端点获取授权码
-        eprintln!("[QQMusic] qqmusic_key 未获取，尝试 QQ Connect authorize 端点");
         // 方式A1: 尝试 Implicit Grant (response_type=token) - 不需要 client_secret
         let authorize_url = "https://graph.qq.com/oauth2.0/authorize?response_type=token&client_id=100497308&redirect_uri=https%3A%2F%2Fy.qq.com%2Fportal%2Fwx_redirect.html&state=qqmusic_login&scope=get_user_info";
         let noredirect_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .map_err(|_| "QQ 登录客户端初始化失败 / QQ login client failed.".to_string())?;
         let authorize_resp = noredirect_client
             .get(authorize_url)
             .header("Cookie", &cookie_header)
@@ -2777,19 +2809,11 @@ async fn follow_qqmusic_login_redirect(
 
         if let Ok(resp) = authorize_resp {
             let status = resp.status();
+            #[cfg(debug_assertions)]
             eprintln!("[QQMusic] authorize 响应状态: {status}");
-            // 打印所有响应头
-            for (k, v) in resp.headers().iter() {
-                eprintln!(
-                    "[QQMusic] authorize header {}: {}",
-                    k,
-                    v.to_str().unwrap_or("<binary>")
-                );
-            }
             // 收集 Set-Cookie
             for cookie in resp.headers().get_all("set-cookie").iter() {
                 if let Ok(s) = cookie.to_str() {
-                    eprintln!("[QQMusic] authorize Set-Cookie: {}", &s[..s.len().min(200)]);
                     // 提取 cookie 名=值 部分
                     if let Some(eq_pos) = s.find('=') {
                         let _cookie_pair = &s[..s.find(';').unwrap_or(s.len())];
@@ -2810,13 +2834,9 @@ async fn follow_qqmusic_login_redirect(
             }
             if let Some(loc) = resp.headers().get("location") {
                 let loc_str = loc.to_str().unwrap_or("");
-                eprintln!(
-                    "[QQMusic] authorize 重定向URL: {}",
-                    &loc_str[..loc_str.len().min(1000)]
-                );
+                parse_trusted_qqmusic_login_url(loc_str)?;
                 // 检查URL中是否包含 access_token (Implicit Grant, 在 fragment # 中)
                 if loc_str.contains("access_token=") {
-                    eprintln!("[QQMusic] authorize URL 包含 access_token (Implicit Grant)!");
                     // 提取 access_token
                     let at_start = loc_str.find("access_token=").unwrap();
                     let at_end = loc_str[at_start..]
@@ -2824,17 +2844,12 @@ async fn follow_qqmusic_login_redirect(
                         .map(|p| at_start + p)
                         .unwrap_or(loc_str.len());
                     let access_token = &loc_str[at_start + 13..at_end];
-                    eprintln!(
-                        "[QQMusic] 提取到 access_token: {}...",
-                        &access_token[..access_token.len().min(20)]
-                    );
                     // 将 access_token 作为 qqmusic_key 使用
                     accumulated.retain(|a| !a.starts_with("qqmusic_key="));
                     accumulated.push(format!("qqmusic_key={}", access_token));
                 }
                 // 检查URL中是否包含 code 参数
                 if loc_str.contains("code=") {
-                    eprintln!("[QQMusic] authorize URL 包含 code 参数!");
                     // 提取 code
                     if let Some(code_start) = loc_str.find("code=") {
                         let code_end = loc_str[code_start..]
@@ -2842,7 +2857,6 @@ async fn follow_qqmusic_login_redirect(
                             .map(|p| code_start + p)
                             .unwrap_or(loc_str.len());
                         let code = &loc_str[code_start + 5..code_end];
-                        eprintln!("[QQMusic] 提取到授权码: {}...", &code[..code.len().min(20)]);
 
                         // 尝试用 code 换取 access_token
                         let token_url = format!(
@@ -2857,21 +2871,17 @@ async fn follow_qqmusic_login_redirect(
                             .send()
                             .await;
                         if let Ok(tr) = token_resp {
-                            let token_text = tr.text().await.unwrap_or_default();
-                            eprintln!(
-                                "[QQMusic] token 响应: {}",
-                                &token_text[..token_text.len().min(500)]
-                            );
+                            #[cfg(debug_assertions)]
+                            eprintln!("[QQMusic] token exchange response: status={}", tr.status());
                         }
                     }
                 } else {
                     // authorize 重定向到 fast_authorize 或其他中间 URL
                     // 跟随重定向链（最多 5 跳），寻找 code= 参数或 Set-Cookie 中的 qqmusic_key
-                    eprintln!("[QQMusic] authorize 重定向不含 code，跟随重定向链...");
-                    let mut auth_url = loc_str.to_string();
+                    let mut auth_url = parse_trusted_qqmusic_login_url(loc_str)?;
                     for auth_hop in 0..5u32 {
                         let auth_resp = noredirect_client
-                            .get(&auth_url)
+                            .get(auth_url.clone())
                             .header("Cookie", &cookie_header)
                             .header("User-Agent", QQMUSIC_UA)
                             .header("Referer", "https://graph.qq.com/")
@@ -2881,22 +2891,11 @@ async fn follow_qqmusic_login_redirect(
                         match auth_resp {
                             Ok(ar) => {
                                 let ar_status = ar.status();
+                                #[cfg(debug_assertions)]
                                 eprintln!("[QQMusic] auth hop {auth_hop}: status={ar_status}");
-                                // 打印所有响应头
-                                for (hk, hv) in ar.headers().iter() {
-                                    eprintln!(
-                                        "[QQMusic]   auth hop {auth_hop} header {}: {}",
-                                        hk,
-                                        hv.to_str().unwrap_or("<binary>")
-                                    );
-                                }
                                 // 收集 Set-Cookie
                                 for sc in ar.headers().get_all("set-cookie").iter() {
                                     if let Ok(s) = sc.to_str() {
-                                        eprintln!(
-                                            "[QQMusic]   auth hop {auth_hop} Set-Cookie: {}",
-                                            &s[..s.len().min(300)]
-                                        );
                                         if let Some(eq_pos) = s.find('=') {
                                             let name = &s[..eq_pos];
                                             let pair_end = s.find(';').unwrap_or(s.len());
@@ -2907,11 +2906,6 @@ async fn follow_qqmusic_login_redirect(
                                                     !a.starts_with(&format!("{}=", name))
                                                 });
                                                 accumulated.push(new_pair);
-                                                eprintln!(
-                                                    "[QQMusic]   ✅ 收集 cookie: {}={}",
-                                                    name,
-                                                    &value[..value.len().min(50)]
-                                                );
                                             }
                                         }
                                     }
@@ -2920,25 +2914,22 @@ async fn follow_qqmusic_login_redirect(
                                 if ar_status.is_redirection() {
                                     if let Some(al) = ar.headers().get("location") {
                                         let al_str = al.to_str().unwrap_or("");
-                                        eprintln!(
-                                            "[QQMusic]   auth hop {auth_hop} Location: {}",
-                                            &al_str[..al_str.len().min(1000)]
-                                        );
+                                        let resolved_auth_url = auth_url.join(al_str).map_err(|_| {
+                                            "QQ 授权跳转地址无效 / Invalid QQ authorization redirect."
+                                                .to_string()
+                                        })?;
+                                        let trusted_auth_url = parse_trusted_qqmusic_login_url(
+                                            resolved_auth_url.as_str(),
+                                        )?;
                                         // 检查是否包含 code= 参数
                                         if al_str.contains("code=") {
-                                            eprintln!("[QQMusic]   ✅ 发现 code= 参数!");
                                             // 如果重定向到 y.qq.com，跟随它（可能设置 qqmusic_key）
                                             if al_str.contains("y.qq.com")
                                                 || al_str.contains("wx_redirect")
                                             {
-                                                eprintln!("[QQMusic]   跟随到 y.qq.com 获取 qqmusic_key...");
-                                                let wx_url = if al_str.starts_with("http") {
-                                                    al_str.to_string()
-                                                } else {
-                                                    format!("https://y.qq.com{}", al_str)
-                                                };
+                                                let wx_url = trusted_auth_url.clone();
                                                 let wx_resp = client
-                                                    .get(&wx_url)
+                                                    .get(wx_url)
                                                     .header("Cookie", &cookie_header)
                                                     .header("User-Agent", QQMUSIC_UA)
                                                     .header("Referer", "https://y.qq.com/")
@@ -2946,6 +2937,7 @@ async fn follow_qqmusic_login_redirect(
                                                     .send()
                                                     .await;
                                                 if let Ok(wr) = wx_resp {
+                                                    #[cfg(debug_assertions)]
                                                     eprintln!(
                                                         "[QQMusic]   wx_redirect status: {}",
                                                         wr.status()
@@ -2954,7 +2946,6 @@ async fn follow_qqmusic_login_redirect(
                                                         wr.headers().get_all("set-cookie").iter()
                                                     {
                                                         if let Ok(s) = sc.to_str() {
-                                                            eprintln!("[QQMusic]   wx_redirect Set-Cookie: {}", &s[..s.len().min(300)]);
                                                             if let Some(eq_pos) = s.find('=') {
                                                                 let name = &s[..eq_pos];
                                                                 let pair_end =
@@ -2975,7 +2966,6 @@ async fn follow_qqmusic_login_redirect(
                                                                         ))
                                                                     });
                                                                     accumulated.push(new_pair);
-                                                                    eprintln!("[QQMusic]   ✅ 收集 cookie: {}={}", name, &value[..value.len().min(50)]);
                                                                 }
                                                             }
                                                         }
@@ -2985,26 +2975,15 @@ async fn follow_qqmusic_login_redirect(
                                             }
                                         }
                                         // 继续跟随
-                                        auth_url = if al_str.starts_with("http") {
-                                            al_str.to_string()
-                                        } else if al_str.starts_with('/') {
-                                            "https://graph.qq.com".to_string() + al_str
-                                        } else {
-                                            al_str.to_string()
-                                        };
+                                        auth_url = trusted_auth_url;
                                         continue;
                                     }
                                 }
                                 // 非重定向，读取 body 检查是否有跳转或表单
                                 let body = ar.text().await.unwrap_or_default();
-                                eprintln!(
-                                    "[QQMusic]   auth hop {auth_hop} 200 body(前2000): {}",
-                                    &body[..body.len().min(2000)]
-                                );
 
                                 // 搜索 access_token 在 body 中
                                 if body.contains("access_token=") {
-                                    eprintln!("[QQMusic]   ✅ body 含 access_token!");
                                     if let Some(at_pos) = body.find("access_token=") {
                                         let at_end = body[at_pos..]
                                             .find('&')
@@ -3012,19 +2991,10 @@ async fn follow_qqmusic_login_redirect(
                                             .unwrap_or(body.len());
                                         let at_val = &body[at_pos + 13..at_end];
                                         if !at_val.is_empty() {
-                                            eprintln!(
-                                                "[QQMusic]   提取 access_token: {}...",
-                                                &at_val[..at_val.len().min(30)]
-                                            );
                                             accumulated.retain(|a| !a.starts_with("qqmusic_key="));
                                             accumulated.push(format!("qqmusic_key={}", at_val));
                                         }
                                     }
-                                }
-
-                                // 搜索 code= 参数
-                                if body.contains("code=") {
-                                    eprintln!("[QQMusic]   ✅ body 含 code=!");
                                 }
 
                                 // 搜索 URL 跳转 (location.href, location.replace, window.location)
@@ -3042,15 +3012,12 @@ async fn follow_qqmusic_login_redirect(
                                         if let Some(q1) = after.find('"') {
                                             if let Some(q2) = after[q1 + 1..].find('"') {
                                                 let url = &after[q1 + 1..q1 + 1 + q2];
-                                                if url.contains("http")
+                                                if (url.contains("http")
                                                     || url.contains("wx_redirect")
                                                     || url.contains("access_token")
-                                                    || url.contains("code=")
+                                                    || url.contains("code="))
+                                                    && parse_trusted_qqmusic_login_url(url).is_ok()
                                                 {
-                                                    eprintln!(
-                                                        "[QQMusic]   ✅ 发现 JS 跳转: {}",
-                                                        &url[..url.len().min(500)]
-                                                    );
                                                     found_auth_url = Some(url.to_string());
                                                     break;
                                                 }
@@ -3065,15 +3032,12 @@ async fn follow_qqmusic_login_redirect(
                                         let after = &body[pos..];
                                         if let Some(end) = after.find('"') {
                                             let url = &after[4..end];
-                                            if url.contains("http")
+                                            if (url.contains("http")
                                                 || url.contains("wx_redirect")
                                                 || url.contains("access_token")
-                                                || url.contains("code=")
+                                                || url.contains("code="))
+                                                && parse_trusted_qqmusic_login_url(url).is_ok()
                                             {
-                                                eprintln!(
-                                                    "[QQMusic]   ✅ 发现 meta refresh URL: {}",
-                                                    &url[..url.len().min(500)]
-                                                );
                                                 found_auth_url = Some(url.to_string());
                                             }
                                         }
@@ -3091,10 +3055,6 @@ async fn follow_qqmusic_login_redirect(
                                                     || url.contains("authorize")
                                                     || url.contains("token")
                                                 {
-                                                    eprintln!(
-                                                        "[QQMusic]   ✅ 发现 form action: {}",
-                                                        &url[..url.len().min(500)]
-                                                    );
                                                     let form_url = if url.starts_with("http") {
                                                         url.to_string()
                                                     } else if url.starts_with('/') {
@@ -3102,6 +3062,7 @@ async fn follow_qqmusic_login_redirect(
                                                     } else {
                                                         format!("https://graph.qq.com/{}", url)
                                                     };
+                                                    parse_trusted_qqmusic_login_url(&form_url)?;
                                                     // 提取所有 hidden input
                                                     let mut form_params = Vec::new();
                                                     let mut search_pos = 0;
@@ -3147,10 +3108,6 @@ async fn follow_qqmusic_login_redirect(
                                                         }
                                                         search_pos = input_end + 1;
                                                     }
-                                                    eprintln!(
-                                                        "[QQMusic]   form hidden params: {:?}",
-                                                        form_params
-                                                    );
                                                     let mut form_url_with_params = form_url;
                                                     if !form_params.is_empty() {
                                                         form_url_with_params.push('?');
@@ -3164,13 +3121,9 @@ async fn follow_qqmusic_login_redirect(
                                                                 .push_str(&format!("{}={}", k, v));
                                                         }
                                                     }
-                                                    eprintln!(
-                                                        "[QQMusic]   提交 form: {}",
-                                                        &form_url_with_params
-                                                            [..form_url_with_params
-                                                                .len()
-                                                                .min(1000)]
-                                                    );
+                                                    parse_trusted_qqmusic_login_url(
+                                                        &form_url_with_params,
+                                                    )?;
                                                     found_auth_url = Some(form_url_with_params);
                                                 }
                                             }
@@ -3179,13 +3132,12 @@ async fn follow_qqmusic_login_redirect(
                                 }
 
                                 if let Some(next_url) = found_auth_url {
-                                    auth_url = next_url;
+                                    auth_url = parse_trusted_qqmusic_login_url(&next_url)?;
                                     continue;
                                 }
                                 break;
                             }
-                            Err(e) => {
-                                eprintln!("[QQMusic]   auth hop {auth_hop} 错误: {e}");
+                            Err(_) => {
                                 break;
                             }
                         }
@@ -3195,7 +3147,6 @@ async fn follow_qqmusic_login_redirect(
         }
 
         // 方式B: 尝试访问 player.html
-        eprintln!("[QQMusic] 尝试访问 player.html");
         let player_resp = client
             .get("https://y.qq.com/portal/player.html")
             .header("User-Agent", QQMUSIC_UA)
@@ -3207,6 +3158,7 @@ async fn follow_qqmusic_login_redirect(
 
         if let Ok(resp_p) = player_resp {
             let p_set_cookie_count = resp_p.headers().get_all("set-cookie").iter().count();
+            #[cfg(debug_assertions)]
             eprintln!(
                 "[QQMusic] player.html: status={}, Set-Cookie headers: {}",
                 resp_p.status(),
@@ -3214,10 +3166,6 @@ async fn follow_qqmusic_login_redirect(
             );
             for v in resp_p.headers().get_all("set-cookie").iter() {
                 if let Ok(s) = v.to_str() {
-                    eprintln!(
-                        "[QQMusic]   player.html Set-Cookie: {}",
-                        &s[..s.len().min(200)]
-                    );
                     if let Some(name_value) = s.split(';').next() {
                         let name_value = name_value.trim();
                         if !name_value.is_empty() {
@@ -3240,36 +3188,13 @@ async fn follow_qqmusic_login_redirect(
         return Err("无法获取QQ音乐登录凭据 / Cannot get QQ Music login cookie.".to_string());
     }
 
+    #[cfg(debug_assertions)]
     eprintln!(
-        "[QQMusic] follow_redirect 完成, uin 提取测试: {:?}",
-        extract_cookie_value(&final_cookie)
-    );
-    let pskey_val = final_cookie
-        .split(';')
-        .find_map(|p| {
-            let p = p.trim();
-            if p.starts_with("p_skey=") {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .unwrap_or("");
-    eprintln!(
-        "[QQMusic] follow_redirect: p_skey 实际值: {}",
-        &pskey_val[..pskey_val.len().min(80)]
-    );
-    eprintln!(
-        "[QQMusic] follow_redirect: 含 superkey={}",
+        "[QQMusic] login redirect complete: credential_length={}, has_uin={}, has_signing_key={}, has_superkey={}",
+        final_cookie.len(),
+        extract_cookie_value(&final_cookie).is_some(),
+        extract_qqmusic_signing_key(&final_cookie).is_some(),
         final_cookie.contains("superkey=")
-    );
-    eprintln!(
-        "[QQMusic] follow_redirect: 含 qqmusic_key={}",
-        final_cookie.contains("qqmusic_key=")
-    );
-    eprintln!(
-        "[QQMusic] follow_redirect final cookie (前500字符): {}",
-        &final_cookie[..final_cookie.len().min(500)]
     );
 
     Ok(final_cookie)
@@ -3581,9 +3506,11 @@ pub async fn fetch_qqmusic_vip_status(
 
     // 调试 / Debug: 诊断 VIP 查询失败原因
     let cookie_str = config.token.as_deref().unwrap_or("");
+    #[cfg(debug_assertions)]
     eprintln!(
-        "[QQMusic] vip_status 诊断: uin_num={uin}, uin_str='{uin_str}', cookie_len={}",
-        cookie_str.len()
+        "[QQMusic] membership query metadata: credential_length={}, has_uin={}",
+        cookie_str.len(),
+        uin > 0
     );
     eprintln!(
         "[QQMusic]   has qqmusic_key={}, has p_skey={}, has skey={}, has uin={}",
@@ -3611,12 +3538,6 @@ pub async fn fetch_qqmusic_vip_status(
 
     match result {
         Ok(value) => {
-            let resp_summary = serde_json::to_string(&value).unwrap_or_default();
-            eprintln!(
-                "[QQMusic] vip_status API响应: {}",
-                &resp_summary[..resp_summary.len().min(800)]
-            );
-
             let req_code = value
                 .get("req_1")
                 .and_then(|r| r.get("code"))
@@ -3640,36 +3561,6 @@ pub async fn fetch_qqmusic_vip_status(
             let map_entry = map_obj
                 .and_then(|obj| obj.get(&uin_str))
                 .or_else(|| map_obj.and_then(|obj| obj.values().next()));
-
-            // 打印 map entry 的所有 key 和 VIP 相关字段用于调试
-            if let Some(entry) = map_entry {
-                if let Some(obj) = entry.as_object() {
-                    let keys: Vec<&String> = obj.keys().collect();
-                    eprintln!("[QQMusic] vip_status: map entry keys = {:?}", keys);
-                    for key in &[
-                        "vipType",
-                        "viptype",
-                        "vipLevel",
-                        "isVip",
-                        "isVip2",
-                        "greenVipLevel",
-                        "superVipLevel",
-                        "baseInfo",
-                        "info",
-                        "vipInfo",
-                        "nick",
-                    ] {
-                        if let Some(val) = obj.get(*key) {
-                            let val_str = serde_json::to_string(val).unwrap_or_default();
-                            eprintln!(
-                                "[QQMusic]   map entry['{}'] = {}",
-                                key,
-                                &val_str[..val_str.len().min(200)]
-                            );
-                        }
-                    }
-                }
-            }
 
             // 先直接在 map entry 上查找 VIP 字段（与 nick 同级）
             // 再回退到 baseInfo/info/vipInfo 子对象中查找
@@ -4132,5 +4023,85 @@ mod tests {
         assert_eq!(QQMUSIC_QUALITY_MAP[2], ("exhigh", "M800", "mp3"));
         assert_eq!(QQMUSIC_QUALITY_MAP[3], ("lossless", "F000", "flac"));
         assert_eq!(QQMUSIC_QUALITY_MAP[4], ("hires", "RS01", "flac"));
+    }
+
+    #[test]
+    fn parses_complete_cookie_without_truncating_padded_values() {
+        let cookie = "pt2gguin=; pt2gguin=o0012345; qm_keyst=secret-value==; display_name=夜色";
+
+        assert_eq!(extract_cookie_value(cookie).as_deref(), Some("12345"));
+        assert_eq!(
+            extract_cookie_raw(cookie, "qm_keyst").as_deref(),
+            Some("secret-value==")
+        );
+        assert!(qqmusic_credential_is_complete(cookie));
+    }
+
+    #[test]
+    fn classifies_auth_failures_without_treating_cookie_presence_as_login() {
+        assert_eq!(
+            classify_qqmusic_auth_failure("network unavailable", false, false),
+            QQMusicAuthState::SignedOut
+        );
+        assert_eq!(
+            classify_qqmusic_auth_failure("missing signing key", true, false),
+            QQMusicAuthState::Failed
+        );
+        assert_eq!(
+            classify_qqmusic_auth_failure("session expired", true, true),
+            QQMusicAuthState::Expired
+        );
+        assert_eq!(
+            classify_qqmusic_auth_failure("network unavailable", true, true),
+            QQMusicAuthState::Unknown
+        );
+    }
+
+    #[test]
+    fn accepts_only_official_qqmusic_endpoints() {
+        assert_eq!(
+            validate_qqmusic_base_url("https://c.y.qq.com/").as_deref(),
+            Ok("https://c.y.qq.com")
+        );
+        assert!(validate_qqmusic_base_url("http://c.y.qq.com").is_err());
+        assert!(validate_qqmusic_base_url("https://user:secret@c.y.qq.com").is_err());
+        assert!(validate_qqmusic_base_url("https://c.y.qq.com:8443").is_err());
+        assert!(validate_qqmusic_base_url("https://c.y.qq.com.example.test").is_err());
+        assert!(validate_qqmusic_base_url("https://127.0.0.1").is_err());
+        assert!(validate_qqmusic_base_url("https://localhost").is_err());
+
+        assert!(is_trusted_qqmusic_webview_url(
+            "https://y.qq.com/n/ryqq/profile"
+        ));
+        assert!(!is_trusted_qqmusic_webview_url(
+            "https://y.qq.com.example.test/login"
+        ));
+    }
+
+    #[test]
+    fn accepts_only_qqmusic_media_hosts() {
+        assert!(is_trusted_qqmusic_media_url(
+            "https://y.gtimg.cn/music/photo_new/cover.jpg"
+        ));
+        assert!(is_trusted_qqmusic_media_url(
+            "https://dl.stream.qqmusic.qq.com/file.m4a"
+        ));
+        assert!(!is_trusted_qqmusic_media_url(
+            "https://y.gtimg.cn.example.test/file.m4a"
+        ));
+        assert!(!is_trusted_qqmusic_media_url("http://127.0.0.1/private"));
+    }
+
+    #[test]
+    fn redacted_diagnostics_never_include_cookie_values() {
+        let secret = "uin=o0012345; qm_keyst=do-not-print-this==; p_skey=private-value";
+        let metadata = redacted_qqmusic_credential_metadata(true, Some(secret));
+        let serialized = serde_json::to_string(&metadata).expect("serialize metadata");
+
+        assert!(metadata["token_exists"].as_bool().unwrap_or(false));
+        assert_eq!(metadata["token_length"].as_u64(), Some(secret.len() as u64));
+        assert!(!serialized.contains("do-not-print-this"));
+        assert!(!serialized.contains("private-value"));
+        assert!(!serialized.contains("o0012345"));
     }
 }

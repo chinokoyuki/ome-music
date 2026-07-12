@@ -560,6 +560,8 @@ export function ProviderSettingsPanel({
             if (!cancelled)
               setQQMusicLoginStatus({
                 loggedIn: false,
+                credentialPresent: false,
+                status: "failed",
                 uin: "",
                 nickname: "",
                 avatarUrl: "",
@@ -1225,11 +1227,7 @@ export function ProviderSettingsPanel({
               const status = await qqmusicAuthProvider.importCookie(result.cookie);
               setQQMusicLoginStatus(status);
               setQQMusicQrStatus("confirmed");
-              setQQMusicMsg(
-                status.loggedIn
-                  ? `QQ音乐已连接${status.nickname ? ` · ${status.nickname}` : ""} / QQ Music connected.`
-                  : `登录失败: ${status.message} / Login failed.`,
-              );
+              setQQMusicMsg(describeQQMusicAuthState(status, true, "detail"));
               // 登录成功后同步前端启用状态（后端 ensure_qqmusic_source_enabled 已设置 DB）
               if (status.loggedIn) {
                 setQQMusicEnabled(true);
@@ -1590,13 +1588,11 @@ export function ProviderSettingsPanel({
                         icon={Music2}
                         title="QQ Music"
                         subtitle="QQ音乐"
-                        value={
-                          qqmusicLoginStatus?.loggedIn
-                            ? "Signed in"
-                            : qqmusicEnabled
-                              ? "Ready"
-                              : "Off"
-                        }
+                        value={describeQQMusicAuthState(
+                          qqmusicLoginStatus,
+                          qqmusicEnabled,
+                          "compact",
+                        )}
                         muted={!qqmusicEnabled}
                       />
                       <StatusTile
@@ -2424,11 +2420,11 @@ export function ProviderSettingsPanel({
                                 QQ音乐 / QQ Music
                               </p>
                               <p className="mt-1 text-xs text-white/36">
-                                {qqmusicLoginStatus?.loggedIn
-                                  ? `已连接${qqmusicLoginStatus.nickname ? ` · ${qqmusicLoginStatus.nickname}` : ""} / Signed in`
-                                  : qqmusicEnabled
-                                    ? "公共内容可用 / Public content available"
-                                    : "未启用 / Disabled"}
+                                {describeQQMusicAuthState(
+                                  qqmusicLoginStatus,
+                                  qqmusicEnabled,
+                                  "detail",
+                                )}
                               </p>
                             </div>
                           </div>
@@ -2489,12 +2485,7 @@ export function ProviderSettingsPanel({
                                 setQQMusicToken("");
                                 setQQMusicLoginStatus(status);
                                 if (status.loggedIn) setQQMusicEnabled(true);
-                                setQQMusicMsg(
-                                  status.loggedIn
-                                    ? `QQ音乐已连接${status.nickname ? ` · ${status.nickname}` : ""} / QQ Music connected.`
-                                    : status.message ||
-                                        "Cookie 无效或已过期 / Invalid or expired cookie.",
-                                );
+                                setQQMusicMsg(describeQQMusicAuthState(status, true, "detail"));
                               } catch (error) {
                                 setQQMusicMsg(readError(error));
                               }
@@ -2594,11 +2585,7 @@ export function ProviderSettingsPanel({
                                 if (cookie) {
                                   const status = await qqmusicAuthProvider.importCookie(cookie);
                                   setQQMusicLoginStatus(status);
-                                  setQQMusicMsg(
-                                    status.loggedIn
-                                      ? `Webview登录成功${status.nickname ? ` · ${status.nickname}` : ""} / Webview login successful.`
-                                      : `Cookie已导入但验证未通过，请确保已在窗口中登录QQ音乐 / Cookie imported but verification failed. Make sure you are logged in.`,
-                                  );
+                                  setQQMusicMsg(describeQQMusicAuthState(status, true, "detail"));
                                   if (status.loggedIn) {
                                     setQQMusicEnabled(true);
                                     await qqmusicAuthProvider.closeWebviewLogin();
@@ -2646,10 +2633,7 @@ export function ProviderSettingsPanel({
                                 setQQMusicLoginStatus(status);
                                 if (status.loggedIn) setQQMusicEnabled(true);
                                 setQQMusicMsg(
-                                  status.loggedIn
-                                    ? `QQ音乐已连接${status.nickname ? ` · ${status.nickname}` : ""} / QQ Music connected.`
-                                    : status.message ||
-                                        "未检测到登录态。请先扫码登录或导入 Cookie。 / No session found.",
+                                  describeQQMusicAuthState(status, qqmusicEnabled, "detail"),
                                 );
                               } catch (e) {
                                 setQQMusicMsg(readError(e));
@@ -4037,6 +4021,33 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       {children}
     </label>
   );
+}
+
+function describeQQMusicAuthState(
+  status: QQMusicLoginStatus | null,
+  enabled: boolean,
+  mode: "compact" | "detail",
+): string {
+  if (status?.loggedIn && status.status === "authenticated") {
+    if (mode === "compact") return "Signed in";
+    return `已连接${status.nickname ? ` · ${status.nickname}` : ""} / Signed in`;
+  }
+  if (status?.status === "expired") {
+    return mode === "compact" ? "Reconnect" : "登录已过期，请重新连接 / Session expired";
+  }
+  if (
+    status?.credentialPresent &&
+    ["credential_present", "verifying", "unknown"].includes(status.status)
+  ) {
+    return mode === "compact"
+      ? "Pending"
+      : "凭据已保存，登录状态待验证 / Credentials saved; status unverified";
+  }
+  if (status?.status === "failed") {
+    return mode === "compact" ? "Check sign-in" : status.message;
+  }
+  if (!enabled) return mode === "compact" ? "Off" : "未启用 / Disabled";
+  return mode === "compact" ? "Ready" : "公共内容可用 / Public content available";
 }
 
 function readError(error: unknown): string {

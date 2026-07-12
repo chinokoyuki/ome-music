@@ -267,11 +267,15 @@ export function LyricsSourceMenu({
                 icon={Cloud}
                 name="QQ音乐"
                 status={
-                  qqmusicLoginStatus?.loggedIn
+                  qqmusicLoginStatus?.loggedIn && qqmusicLoginStatus.status === "authenticated"
                     ? "已连接"
-                    : qqmusicConfig?.enabled
-                      ? "公共内容可用"
-                      : "关闭"
+                    : qqmusicLoginStatus?.status === "expired"
+                      ? "请重新登录"
+                      : qqmusicLoginStatus?.credentialPresent
+                        ? "登录待验证"
+                        : qqmusicConfig?.enabled
+                          ? "公共内容可用"
+                          : "关闭"
                 }
                 ready={Boolean(qqmusicConfig?.enabled)}
               />

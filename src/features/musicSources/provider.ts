@@ -36,8 +36,19 @@ export interface QQMusicSourceConfig extends MusicSourceConfig {
   searchScope: "all" | "song" | "album" | "playlist" | "mv";
 }
 
+export type QQMusicAuthState =
+  | "signed_out"
+  | "credential_present"
+  | "verifying"
+  | "authenticated"
+  | "expired"
+  | "unknown"
+  | "failed";
+
 export interface QQMusicLoginStatus {
   loggedIn: boolean;
+  credentialPresent: boolean;
+  status: QQMusicAuthState;
   uin: string;
   nickname: string;
   avatarUrl: string;
@@ -865,6 +876,8 @@ export class QQMusicAccountSessionProvider {
     if (!isTauriRuntime())
       return {
         loggedIn: true,
+        credentialPresent: true,
+        status: "authenticated",
         uin: "",
         nickname: "",
         avatarUrl: "",
@@ -886,12 +899,6 @@ export class QQMusicAccountSessionProvider {
     return invoke<string>("extract_qqmusic_webview_cookie");
   }
 
-  /** 诊断：导出 cookie 和提取值的详细信息 */
-  async debugDump(): Promise<Record<string, unknown>> {
-    if (!isTauriRuntime()) return {};
-    return invoke<Record<string, unknown>>("qqmusic_debug_dump");
-  }
-
   /** 关闭 webview 登录窗口 */
   async closeWebviewLogin(): Promise<void> {
     if (!isTauriRuntime()) return;
@@ -902,6 +909,8 @@ export class QQMusicAccountSessionProvider {
     if (!isTauriRuntime())
       return {
         loggedIn: false,
+        credentialPresent: false,
+        status: "signed_out",
         uin: "",
         nickname: "",
         avatarUrl: "",
@@ -919,6 +928,8 @@ export class QQMusicAccountSessionProvider {
     if (!isTauriRuntime())
       return {
         loggedIn: false,
+        credentialPresent: false,
+        status: "signed_out",
         uin: "",
         nickname: "",
         avatarUrl: "",
