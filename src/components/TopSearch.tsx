@@ -531,8 +531,14 @@ export function TopSearch({
                       type="button"
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={async () => {
-                        await onPlayQQMusic(song);
-                        setOpen(false);
+                        const started = await onPlayQQMusic(song);
+                        if (started) {
+                          setOpen(false);
+                        } else {
+                          setQQMusicMessage(
+                            "无法播放这首歌，请查看提示后重试 / Couldn't play this track. Check the notice and try again.",
+                          );
+                        }
                       }}
                       className="search-result-row"
                     >

@@ -562,7 +562,7 @@ export default function App() {
       window.clearTimeout(restoreTimer);
       window.clearTimeout(backgroundTimer);
     };
-  }, [restoredSnapshotTrack]);
+  }, [restoredSnapshotTrack, startupSnapshot]);
 
   useEffect(() => {
     setRadioSession((session) => updateRadioSessionPlayback(session, currentTrackId, isPlaying));

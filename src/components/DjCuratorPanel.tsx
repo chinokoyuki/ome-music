@@ -1,6 +1,6 @@
 import { Loader2, Mic, Radio, Send, Square, X } from "lucide-react";
 import clsx from "clsx";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { runCuratorAgent, type CuratorAgentStatus } from "../features/curator/curatorAgent";
 import { englishTrackReference, guardCuratorReply } from "../features/curator/curatorLanguageGuard";
 import {
@@ -279,21 +279,21 @@ export function DjCuratorPanel({
     }
   };
 
-  const cancelVoiceChat = () => {
+  const cancelVoiceChat = useCallback(() => {
     recordingRef.current?.cancel();
     recordingRef.current = null;
     if (recordingTimeoutRef.current !== null) window.clearTimeout(recordingTimeoutRef.current);
     recordingTimeoutRef.current = null;
     setVoiceStatus("idle");
     setWaveform(Array.from({ length: 15 }, () => 0.06));
-  };
+  }, []);
 
   const openPanel = () => setOpen(true);
 
-  const closePanel = () => {
+  const closePanel = useCallback(() => {
     if (recordingRef.current) cancelVoiceChat();
     setOpen(false);
-  };
+  }, [cancelVoiceChat]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -302,7 +302,7 @@ export function DjCuratorPanel({
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [isOpen]);
+  }, [closePanel, isOpen]);
 
   return (
     <>

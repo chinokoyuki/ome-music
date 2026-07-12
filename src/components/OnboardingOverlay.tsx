@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- persistence helpers intentionally live with the overlay */
 import { useState } from "react";
 import {
   ArrowRight,

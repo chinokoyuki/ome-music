@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- playback constants are shared with the player shell */
 import {
   ListMusic,
   Gauge,

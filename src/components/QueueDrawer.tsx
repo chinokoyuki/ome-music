@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- preference helpers intentionally live with the queue drawer */
 import { useEffect } from "react";
 import type React from "react";
 import { Heart, ListMusic, Sparkles, Trash2, X } from "lucide-react";
