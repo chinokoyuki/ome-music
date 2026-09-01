@@ -106,7 +106,7 @@ fn parse_trusted_qqmusic_login_url(value: &str) -> Result<reqwest::Url, String> 
     Ok(url)
 }
 
-fn is_trusted_qqmusic_media_url(value: &str) -> bool {
+pub fn is_trusted_qqmusic_media_url(value: &str) -> bool {
     reqwest::Url::parse(value)
         .ok()
         .filter(|url| {
@@ -117,6 +117,19 @@ fn is_trusted_qqmusic_media_url(value: &str) -> bool {
         })
         .and_then(|url| url.host_str().map(is_trusted_qqmusic_media_host))
         .unwrap_or(false)
+}
+
+/// HTML 片段提取辅助：在第一个 ASCII 终止符处截断；若超长（500 字节内无
+/// 终止符），按字符边界截断，绝不落在多字节 UTF-8 字符中间（否则
+/// `&s[..end]` 会在 release panic=abort 下崩掉整个进程）。
+fn truncate_html_fragment(value: &str) -> &str {
+    const MAX_HINT: usize = 500;
+    if let Some(pos) = value.find(['"', '\'', '>', ';', ')']) {
+        return &value[..pos];
+    }
+    let byte_end = value.len().min(MAX_HINT);
+    let boundary = value.floor_char_boundary(byte_end);
+    &value[..boundary]
 }
 
 pub fn validate_qqmusic_base_url(value: &str) -> Result<String, String> {
@@ -338,11 +351,26 @@ fn extract_qqmusic_signing_key(cookie: &str) -> Option<String> {
 pub fn qqmusic_credential_is_complete(cookie: &str) -> bool {
     let has_signing_key = extract_qqmusic_signing_key(cookie).is_some()
         || extract_cookie_raw(cookie, "p_skey").is_some()
-        || extract_cookie_raw(cookie, "superkey").is_some();
-    let has_uin = ["uin", "pt2gguin", "superuin"]
+        || extract_cookie_raw(cookie, "superkey").is_some()
+        || extract_cookie_raw(cookie, "psrf_qqaccess_token").is_some();
+    let has_qq_identity = ["uin", "pt2gguin", "superuin", "p_uin"]
         .iter()
         .any(|name| extract_cookie_raw(cookie, name).is_some());
-    has_signing_key && has_uin
+    let has_wechat_uin = ["wxuin", "euin"]
+        .iter()
+        .any(|name| extract_cookie_raw(cookie, name).is_some());
+    let has_wechat_openid = ["wxopenid", "psrf_qqopenid"]
+        .iter()
+        .any(|name| extract_cookie_raw(cookie, name).is_some());
+    let has_wechat_unionid = ["wxunionid", "psrf_qqunionid"]
+        .iter()
+        .any(|name| extract_cookie_raw(cookie, name).is_some());
+    let has_wechat_refresh = ["wxrefresh_token", "psrf_qqrefresh_token"]
+        .iter()
+        .any(|name| extract_cookie_raw(cookie, name).is_some());
+    let has_wechat_identity =
+        has_wechat_uin && has_wechat_openid && has_wechat_unionid && has_wechat_refresh;
+    has_signing_key && (has_qq_identity || has_wechat_identity)
 }
 
 pub fn classify_qqmusic_auth_failure(
@@ -439,11 +467,25 @@ fn clear_uin_param(s: &str) -> String {
 /// Without comm.uin, the API treats the request as anonymous.
 fn build_qqmusic_comm(config: &ResolvedQQMusicSourceConfig) -> serde_json::Value {
     let uin_str = resolve_qqmusic_uin(config);
+    let cookie = config.token.as_deref().unwrap_or("");
+    let authst = extract_qqmusic_signing_key(cookie)
+        .or_else(|| extract_cookie_raw(cookie, "p_skey"))
+        .or_else(|| extract_cookie_raw(cookie, "skey"))
+        .unwrap_or_default();
+    let (g_tk, g_tk_new) = resolve_qqmusic_gtk(config);
     serde_json::json!({
         "uin": uin_str,
         "format": "json",
         "ct": 24,
-        "cv": 0
+        "cv": 4_747_474,
+        "inCharset": "utf-8",
+        "outCharset": "utf-8",
+        "notice": 0,
+        "platform": "yqq.json",
+        "needNewCode": 1,
+        "g_tk": g_tk,
+        "g_tk_new_20200303": g_tk_new,
+        "authst": authst
     })
 }
 
@@ -589,6 +631,74 @@ pub async fn request_qqmusic_json_post(
     })
 }
 
+/// 发送现代 QQ 音乐 JSON POST 请求。
+/// `music.vkey.GetVkey.UrlGetVkey` 使用 JSON 请求体；继续复用 GET + data
+/// 会让服务端回落到匿名或返回旧版无效 vkey。
+/// Send a modern QQ Music JSON POST request. UrlGetVkey expects a JSON body;
+/// using the legacy GET wrapper can silently downgrade the session to anonymous.
+async fn request_qqmusic_json_body(
+    config: &ResolvedQQMusicSourceConfig,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let client = qqmusic_api_client()?;
+    let trusted_url = parse_trusted_qqmusic_api_url(url)?;
+    let mut request = client
+        .post(trusted_url)
+        .header("Referer", "https://y.qq.com/")
+        .header("Origin", "https://y.qq.com")
+        .header("User-Agent", QQMUSIC_UA)
+        .header("Accept", "application/json, text/plain, */*")
+        .json(body);
+
+    if let Some(cookie) = config.token.as_deref() {
+        request = request.header("Cookie", cookie);
+    }
+
+    let response = request
+        .timeout(std::time::Duration::from_secs(12))
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                "timeout: QQ音乐播放地址请求超时 / QQ Music playback request timed out.".to_string()
+            } else {
+                "api_failed: QQ音乐播放地址请求失败 / QQ Music playback request failed.".to_string()
+            }
+        })?;
+    let status = response.status();
+    let text = response.text().await.map_err(|_| {
+        "QQ音乐播放响应读取失败 / Failed to read QQ Music playback response.".to_string()
+    })?;
+
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[QQMusic] modern vkey response: status={status}, body_length={}",
+        text.len()
+    );
+
+    if status == 412 || status == 503 {
+        return Err("rate_limited: 请求过于频繁，请稍后再试 / Rate limited.".to_string());
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "api_failed: QQ音乐播放地址返回状态 {} / QQ Music playback returned status {}.",
+            status.as_u16(),
+            status.as_u16()
+        ));
+    }
+    if text.trim_start().starts_with("<!DOCTYPE") || text.trim_start().starts_with("<html") {
+        return Err("QQ音乐需要网页验证 / QQ Music requires web verification.".to_string());
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|_| {
+        format!(
+            "QQ音乐播放响应解析失败 / Failed to parse QQ Music playback JSON (body_length={})",
+            text.len()
+        )
+    })
+}
+
 /// 发送 QQ 音乐 API 请求（匿名，不发送 Cookie）
 pub async fn request_qqmusic_json_post_anon(
     url: &str,
@@ -665,6 +775,34 @@ fn json_text(value: Option<&serde_json::Value>) -> Option<String> {
 
 fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
     value.and_then(|v| v.as_u64())
+}
+
+fn qqmusic_song_id_parts(value: &str) -> (&str, Option<&str>) {
+    match value.split_once('|') {
+        Some((songmid, media_mid)) if !songmid.is_empty() && !media_mid.is_empty() => {
+            (songmid, Some(media_mid))
+        }
+        _ => (value, None),
+    }
+}
+
+fn qqmusic_media_mid(value: &serde_json::Value) -> Option<String> {
+    json_text(value.get("strMediaMid"))
+        .or_else(|| json_text(value.get("media_mid")))
+        .or_else(|| json_text(value.get("mediaMid")))
+        .or_else(|| {
+            value.get("file").and_then(|file| {
+                json_text(file.get("media_mid")).or_else(|| json_text(file.get("mediaMid")))
+            })
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn qqmusic_source_song_id(songmid: &str, media_mid: Option<&str>) -> String {
+    match media_mid.filter(|value| !value.is_empty() && *value != songmid) {
+        Some(media_mid) => format!("{songmid}|{media_mid}"),
+        None => songmid.to_string(),
+    }
 }
 
 // ── 搜索 ──────────────────────────────────────────────────────────────
@@ -780,6 +918,7 @@ async fn try_qqmusic_search(
 /// 从搜索结果的 JSON 映射为 SourceSongDto
 fn source_song_from_qqmusic_search_json(value: &serde_json::Value) -> SourceSongDto {
     let songmid = json_text(value.get("songmid")).unwrap_or_default();
+    let media_mid = qqmusic_media_mid(value);
     let songname = json_text(value.get("songname")).unwrap_or_else(|| "Unknown Song".to_string());
     let title = songname
         .replace("<em>", "")
@@ -814,7 +953,7 @@ fn source_song_from_qqmusic_search_json(value: &serde_json::Value) -> SourceSong
     let unavailable = false; // 搜索时先标记为可用，播放时再判断
 
     SourceSongDto {
-        id: songmid.clone(),
+        id: qqmusic_source_song_id(&songmid, media_mid.as_deref()),
         source: Some("qqmusic".to_string()),
         title,
         artist,
@@ -840,8 +979,9 @@ fn source_song_from_qqmusic_search_json(value: &serde_json::Value) -> SourceSong
 /// 获取 QQ 音乐单曲详情
 pub async fn fetch_qqmusic_song_metadata(
     config: &ResolvedQQMusicSourceConfig,
-    songmid: &str,
+    song_id: &str,
 ) -> Result<SourceSongDto, String> {
+    let (songmid, requested_media_mid) = qqmusic_song_id_parts(song_id);
     // 使用 musicu.fcg 获取歌曲详情
     let _guid = rand_guid();
     let (_g_tk, _g_tk_new) = resolve_qqmusic_gtk(config);
@@ -880,11 +1020,13 @@ pub async fn fetch_qqmusic_song_metadata(
     let albumname = json_text(album_obj.and_then(|a| a.get("name")))
         .unwrap_or_else(|| "Unknown Album".to_string());
     let albummid = json_text(album_obj.and_then(|a| a.get("mid"))).unwrap_or_default();
+    let media_mid =
+        qqmusic_media_mid(info).or_else(|| requested_media_mid.map(ToString::to_string));
     let cover_url = qqmusic_cover_url(&albummid);
     let interval = json_u64(info.get("interval")).unwrap_or(0);
 
     Ok(SourceSongDto {
-        id: songmid.to_string(),
+        id: qqmusic_source_song_id(songmid, media_mid.as_deref()),
         source: Some("qqmusic".to_string()),
         title: songname,
         artist,
@@ -907,14 +1049,197 @@ pub async fn fetch_qqmusic_song_metadata(
 
 // ── 播放链接 (vKey) ──────────────────────────────────────────────────
 
+fn build_qqmusic_vkey_comm(config: &ResolvedQQMusicSourceConfig) -> serde_json::Value {
+    let mut comm = serde_json::json!({
+        "format": "json",
+        "ct": 24,
+        "cv": 0,
+        "uin": resolve_qqmusic_uin(config),
+    });
+    if let Some(authst) = extract_qqmusic_signing_key(config.token.as_deref().unwrap_or("")) {
+        if let Some(object) = comm.as_object_mut() {
+            object.insert("authst".to_string(), serde_json::Value::String(authst));
+        }
+    }
+    comm
+}
+
+fn qqmusic_modern_filenames(quality: &str, songmid: &str, media_mid: Option<&str>) -> Vec<String> {
+    let variants: &[(&str, &str)] = match quality {
+        "hires" => &[("RS01", "flac"), ("F000", "flac")],
+        "lossless" => &[("F000", "flac")],
+        "exhigh" => &[("M800", "mp3"), ("C600", "m4a")],
+        "higher" => &[("M500", "mp3"), ("C400", "m4a")],
+        _ => &[("C400", "m4a"), ("M500", "mp3")],
+    };
+    let file_mid = media_mid.filter(|value| !value.is_empty());
+    variants
+        .iter()
+        .map(|(prefix, extension)| match file_mid {
+            Some(media_mid) => format!("{prefix}{media_mid}.{extension}"),
+            None => format!("{prefix}{songmid}{songmid}.{extension}"),
+        })
+        .collect()
+}
+
+fn normalized_qqmusic_cdn_base(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let https = if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else {
+        trimmed.to_string()
+    };
+    let with_slash = format!("{https}/");
+    is_trusted_qqmusic_media_url(&with_slash).then_some(https)
+}
+
+fn qqmusic_vkey_candidate_urls(
+    response: &serde_json::Value,
+    data: &serde_json::Value,
+    purl: &str,
+) -> Vec<String> {
+    let trimmed_purl = purl.trim();
+    if trimmed_purl.starts_with("http://") || trimmed_purl.starts_with("https://") {
+        let promoted = trimmed_purl.replacen("http://", "https://", 1);
+        return is_trusted_qqmusic_media_url(&promoted)
+            .then_some(promoted)
+            .into_iter()
+            .collect();
+    }
+    if trimmed_purl.is_empty()
+        || trimmed_purl.contains(';')
+        || trimmed_purl.contains("..")
+        || trimmed_purl.contains('\\')
+    {
+        return Vec::new();
+    }
+
+    let mut bases = Vec::new();
+    for source in [
+        response.get("req").and_then(|req| req.get("data")),
+        response.get("req").and_then(|req| req.get("result")),
+        Some(data),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(sips) = source.get("sip").and_then(|value| value.as_array()) {
+            for sip in sips.iter().filter_map(|value| value.as_str()) {
+                if let Some(base) = normalized_qqmusic_cdn_base(sip) {
+                    if !bases.contains(&base) {
+                        bases.push(base);
+                    }
+                }
+            }
+        }
+    }
+    if bases.is_empty() {
+        bases.push("https://isure.stream.qqmusic.qq.com".to_string());
+    }
+
+    bases
+        .into_iter()
+        .map(|base| {
+            format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                trimmed_purl.trim_start_matches('/')
+            )
+        })
+        .filter(|url| is_trusted_qqmusic_media_url(url))
+        .take(QQMUSIC_MAX_MEDIA_CANDIDATES)
+        .collect()
+}
+
+async fn fetch_modern_qqmusic_vkey_candidates(
+    config: &ResolvedQQMusicSourceConfig,
+    songmid: &str,
+    filename: &str,
+    guid: &str,
+) -> Result<Vec<String>, String> {
+    let uin = resolve_qqmusic_uin(config);
+    let body = serde_json::json!({
+        "loginUin": uin,
+        "comm": build_qqmusic_vkey_comm(config),
+        "req": {
+            "module": "music.audioCdnDispatch.cdnDispatch",
+            "method": "GetCdnDispatch",
+            "param": {
+                "guid": guid,
+                "uid": "0",
+                "use_new_domain": 1,
+                "use_ipv6": 1
+            }
+        },
+        "req_0": {
+            "module": "music.vkey.GetVkey",
+            "method": "UrlGetVkey",
+            "param": {
+                "uin": resolve_qqmusic_uin(config),
+                "filename": [filename],
+                "guid": guid,
+                "songmid": [songmid],
+                "songtype": [0],
+                "ctx": 0
+            }
+        }
+    });
+    let response =
+        request_qqmusic_json_body(config, "https://u.y.qq.com/cgi-bin/musicu.fcg", &body).await?;
+    let request = response.get("req_0");
+    let request_code = request
+        .and_then(|value| value.get("code"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    let data = request
+        .and_then(|value| value.get("data").or_else(|| value.get("result")))
+        .or_else(|| response.get("data"))
+        .ok_or_else(|| "no_data".to_string())?;
+    let retcode = data
+        .get("retcode")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    if request_code == 104009 || retcode == 104009 {
+        return Err("region_restricted: QQ 音乐拒绝了当前网络会话 / QQ Music rejected the current network session."
+            .to_string());
+    }
+    if request_code != 0 {
+        return Err(format!("api_code_{request_code}"));
+    }
+
+    let info = data
+        .get("midurlinfo")
+        .and_then(|value| value.as_array())
+        .and_then(|items| items.first())
+        .or_else(|| {
+            data.get("data")
+                .and_then(|nested| nested.get("midurlinfo"))
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+        })
+        .ok_or_else(|| "no_data".to_string())?;
+    let purl = info
+        .get("purl")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| classify_qqmusic_no_purl(Some(info)).to_string())?;
+    let candidates = qqmusic_vkey_candidate_urls(&response, data, purl);
+    if candidates.is_empty() {
+        return Err("no_copyright".to_string());
+    }
+    Ok(candidates)
+}
+
 /// 获取播放链接 (vKey 签名)
 /// 支持音质降级：如果请求的音质失败（API错误或空purl），
 /// 自动尝试更低音质直到 standard。
 pub async fn fetch_qqmusic_playable_url(
     config: &ResolvedQQMusicSourceConfig,
-    songmid: &str,
+    song_id: &str,
     quality: Option<&str>,
 ) -> Result<PlayableUrlDto, String> {
+    let requested_song_id = song_id;
+    let (songmid, media_mid) = qqmusic_song_id_parts(song_id);
     let requested_quality = quality.unwrap_or("standard");
 
     // 音质降级链：从高到低
@@ -949,6 +1274,50 @@ pub async fn fetch_qqmusic_playable_url(
     let mut collected_urls: Vec<String> = Vec::new();
 
     for &q in quality_chain {
+        for filename in qqmusic_modern_filenames(q, songmid, media_mid) {
+            #[cfg(debug_assertions)]
+            eprintln!("[QQMusic] modern playback attempt: quality={q}");
+            match fetch_modern_qqmusic_vkey_candidates(config, songmid, &filename, &guid).await {
+                Ok(urls) if !urls.is_empty() => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[QQMusic] modern playback resolved {} trusted candidate(s)",
+                        urls.len()
+                    );
+                    let primary = urls[0].clone();
+                    return Ok(PlayableUrlDto {
+                        song_id: requested_song_id.to_string(),
+                        url: Some(primary),
+                        video_url: None,
+                        unavailable: false,
+                        reason: None,
+                        debug: None,
+                        audio_candidates: urls.into_iter().skip(1).collect(),
+                        video_candidates: Vec::new(),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.starts_with("region_restricted") => {
+                    return Ok(PlayableUrlDto {
+                        song_id: requested_song_id.to_string(),
+                        url: None,
+                        video_url: None,
+                        unavailable: true,
+                        reason: Some("region_restricted".to_string()),
+                        debug: None,
+                        audio_candidates: Vec::new(),
+                        video_candidates: Vec::new(),
+                    });
+                }
+                Err(error) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[QQMusic] modern playback candidate unavailable: {error}");
+                    _last_error = Some(error.clone());
+                    last_reason = classify_qqmusic_playurl_reason(&error).to_string();
+                }
+            }
+        }
+
         let (prefix, ext) = QQMUSIC_QUALITY_MAP
             .iter()
             .find(|(ql, _, _)| *ql == q)
@@ -1202,7 +1571,7 @@ pub async fn fetch_qqmusic_playable_url(
         let primary = collected_urls[0].clone();
         let rest: Vec<String> = collected_urls[1..].to_vec();
         return Ok(PlayableUrlDto {
-            song_id: songmid.to_string(),
+            song_id: requested_song_id.to_string(),
             url: Some(primary),
             video_url: None,
             unavailable: false,
@@ -1377,7 +1746,7 @@ pub async fn fetch_qqmusic_playable_url(
         let primary = collected_urls[0].clone();
         let rest: Vec<String> = collected_urls[1..].to_vec();
         return Ok(PlayableUrlDto {
-            song_id: songmid.to_string(),
+            song_id: requested_song_id.to_string(),
             url: Some(primary),
             video_url: None,
             unavailable: false,
@@ -1389,7 +1758,7 @@ pub async fn fetch_qqmusic_playable_url(
     }
 
     Ok(PlayableUrlDto {
-        song_id: songmid.to_string(),
+        song_id: requested_song_id.to_string(),
         url: None,
         video_url: None,
         unavailable: true,
@@ -1446,8 +1815,9 @@ pub fn classify_qqmusic_playurl_reason(error_msg: &str) -> &'static str {
 /// 获取 QQ 音乐歌词
 pub async fn fetch_qqmusic_lyrics(
     config: &ResolvedQQMusicSourceConfig,
-    songmid: &str,
+    song_id: &str,
 ) -> Result<(String, String), String> {
+    let (songmid, _) = qqmusic_song_id_parts(song_id);
     let text = request_qqmusic_text(
         config,
         "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg",
@@ -1583,10 +1953,10 @@ pub fn resolve_qqmusic_uin_num(config: &ResolvedQQMusicSourceConfig) -> u64 {
 fn extract_cookie_value(cookie: &str) -> Option<String> {
     // QQ 登录后 cookie 中可能没有独立的 uin= 字段，
     // 但 pt2gguin= 和 superuin= 中包含 uin 值（格式如 o1747846382）。
-    // 按优先级依次尝试：uin → pt2gguin → superuin
+    // 按优先级依次尝试 QQ 与微信登录可能写入的数字身份字段。
     // 注意：Set-Cookie 可能先发空值再发实际值（如 pt2gguin=; pt2gguin=o1747846382），
     // 所以对每个名字遍历所有匹配，跳过空值继续找。
-    for name in &["uin", "pt2gguin", "superuin"] {
+    for name in &["uin", "pt2gguin", "superuin", "p_uin", "wxuin"] {
         let prefix = format!("{}=", name);
         for part in cookie.split(';') {
             let part = part.trim();
@@ -1636,23 +2006,16 @@ pub fn proxy_qqmusic_search_covers(
     Ok(())
 }
 
-/// 为 DB 中的 QQ 音乐 track 封面注册代理
+/// DB 中的 QQ 音乐 track 封面：保持稳定 URL（https://y.gtimg.cn 等）直出。
+/// 与 NetEase/Bilibili 库行策略一致——不替换为短命代理 token（TTL/LRU
+/// 驱逐会让大队列与长会话回到占位封面），也绝不因为"无法代理"而清空封面
+/// 字段。搜索结果的瞬时封面仍走 proxy_qqmusic_search_covers。
 pub fn proxy_qqmusic_track_covers(
     state: &AppState,
     tracks: &mut [crate::TrackDto],
 ) -> Result<(), String> {
-    for track in tracks.iter_mut().filter(|t| t.source == "qqmusic") {
-        if is_proxyable_remote_url(&track.cover_url)
-            && is_trusted_qqmusic_media_url(&track.cover_url)
-        {
-            track.cover_url = register_media_proxy(state, &track.cover_url, "image")?;
-        } else if !track.cover_url.is_empty()
-            && !track.cover_url.starts_with("ome-media:")
-            && !track.cover_url.contains("ome-media.localhost")
-        {
-            track.cover_url.clear();
-        }
-    }
+    let _ = state;
+    let _ = tracks;
     Ok(())
 }
 
@@ -1790,24 +2153,6 @@ pub fn resolve_qqmusic_source_config(
         base_url: config.base_url,
         token: read_qqmusic_token(),
     })
-}
-
-/// 登录成功后自动启用 QQ 音乐来源。
-/// 所有登录流程（QR 扫码、Cookie 导入、WebView 提取）在保存 cookie 到 keyring 后，
-/// 都应调用此函数确保 DB 中 enabled=1，否则用户重开设置面板后会看到"已禁用"状态，
-/// 且 resolve_qqmusic_source_config 会返回错误导致播放/VIP 查询全部失败。
-pub fn ensure_qqmusic_source_enabled(db: &Connection) -> Result<(), String> {
-    db.execute(
-        "INSERT INTO music_source_settings (id, enabled, base_url, token_ref, created_at, updated_at)
-         VALUES ('qqmusic', 1, ?1, 'local', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-         ON CONFLICT(id) DO UPDATE SET
-           enabled = 1,
-           token_ref = 'local',
-           updated_at = CURRENT_TIMESTAMP",
-        params![QQMUSIC_DEFAULT_BASE_URL],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 // ── 测试连接 ──────────────────────────────────────────────────────────
@@ -2205,6 +2550,17 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
 
     let resp_status = resp.status();
 
+    if resp_status == reqwest::StatusCode::FORBIDDEN {
+        return Ok(QQMusicQrCheckDto {
+            status: "failed".to_string(),
+            cookie: None,
+            message: Some(
+                "QQ 直连扫码当前不可用，请使用官方网页登录 / Direct QR is unavailable; use Official Sign-in."
+                    .to_string(),
+            ),
+        });
+    }
+
     // 检查是否为重定向响应（302/301）——登录成功时 QQ 服务器可能返回 302
     if resp_status.is_redirection() {
         let redirect_url = resp
@@ -2487,10 +2843,7 @@ async fn follow_qqmusic_login_redirect(
         if let Some(pos) = body.find("url=") {
             let after = &body[pos + 4..];
             let after = after.trim_start_matches('"').trim_start_matches('\'');
-            let end = after
-                .find(['"', '\'', '>', ';'])
-                .unwrap_or(after.len().min(500));
-            let extracted = &after[..end];
+            let extracted = truncate_html_fragment(after);
             if parse_trusted_qqmusic_login_url(extracted).is_ok() {
                 found_url = Some(extracted.to_string());
             }
@@ -2510,10 +2863,7 @@ async fn follow_qqmusic_login_redirect(
                     .trim_start()
                     .trim_start_matches('"')
                     .trim_start_matches('\'');
-                let end = after
-                    .find(['"', '\'', ')', ';'])
-                    .unwrap_or(after.len().min(500));
-                let extracted = &after[..end];
+                let extracted = truncate_html_fragment(after);
                 if parse_trusted_qqmusic_login_url(extracted).is_ok() {
                     found_url = Some(extracted.to_string());
                     break;
@@ -2604,10 +2954,7 @@ async fn follow_qqmusic_login_redirect(
                     .trim_start()
                     .trim_start_matches('"')
                     .trim_start_matches('\'');
-                let end = after
-                    .find(['"', '\'', ')', ';'])
-                    .unwrap_or(after.len().min(500));
-                let extracted = &after[..end];
+                let extracted = truncate_html_fragment(after);
                 if parse_trusted_qqmusic_login_url(extracted).is_ok() {
                     y_found_url = Some(extracted.to_string());
                     break;
@@ -2618,10 +2965,7 @@ async fn follow_qqmusic_login_redirect(
             if let Some(pos) = y_body.find("url=") {
                 let after = &y_body[pos + 4..];
                 let after = after.trim_start_matches('"').trim_start_matches('\'');
-                let end = after
-                    .find(['"', '\'', '>', ';'])
-                    .unwrap_or(after.len().min(500));
-                let extracted = &after[..end];
+                let extracted = truncate_html_fragment(after);
                 if parse_trusted_qqmusic_login_url(extracted).is_ok() {
                     y_found_url = Some(extracted.to_string());
                 }
@@ -3400,6 +3744,7 @@ fn source_song_from_qqmusic_playlist_json(value: &serde_json::Value) -> SourceSo
     let songmid = json_text(value.get("songmid"))
         .or_else(|| json_text(value.get("mid")))
         .unwrap_or_default();
+    let media_mid = qqmusic_media_mid(value);
     let songname = json_text(value.get("songname"))
         .or_else(|| json_text(value.get("name")))
         .unwrap_or_else(|| "Unknown Song".to_string());
@@ -3428,7 +3773,7 @@ fn source_song_from_qqmusic_playlist_json(value: &serde_json::Value) -> SourceSo
     };
 
     SourceSongDto {
-        id: songmid.clone(),
+        id: qqmusic_source_song_id(&songmid, media_mid.as_deref()),
         source: Some("qqmusic".to_string()),
         title: songname,
         artist,
@@ -3678,10 +4023,13 @@ pub async fn fetch_qqmusic_vip_status(
                 }
 
                 if req_code != 0 && has_key {
-                    // API rejected our request format (e.g. 500005),
-                    // but user has valid cookie — don't claim non-member.
+                    // API rejected our request format (e.g. 500005) —
+                    // the user has a cookie but we could NOT verify
+                    // membership. Report "unknown" (is_member: false +
+                    // membership_known: false), never claim non-member
+                    // or member without API confirmation.
                     Ok(QQMusicVipStatusDto {
-                        is_member: true,
+                        is_member: false,
                         level: None,
                         message: "已登录，VIP状态未知 / Logged in, VIP status unknown.".to_string(),
                         membership_known: false,
@@ -3704,8 +4052,11 @@ pub async fn fetch_qqmusic_vip_status(
             let has_key = extract_qqmusic_signing_key(cookie).is_some()
                 || extract_cookie_raw(cookie, "p_skey").is_some();
             if has_key {
+                // API request failed but a cookie exists. Membership is
+                // UNKNOWN — do not claim the user is a member (or a
+                // non-member) without an API confirmation.
                 Ok(QQMusicVipStatusDto {
-                    is_member: true, // Don't claim non-member; user is logged in
+                    is_member: false,
                     level: None,
                     message: "已登录，VIP状态未知 / Logged in, VIP status unknown.".to_string(),
                     membership_known: false,
@@ -3744,10 +4095,13 @@ async fn try_get_vip_from_login_info(
         request_qqmusic_json_post(config, "https://u.y.qq.com/cgi-bin/musicu.fcg", &body).await;
 
     if let Ok(value) = result {
-        let resp_summary = serde_json::to_string(&value).unwrap_or_default();
+        // Log only metadata, never the raw response body: GetLoginInfo can
+        // echo account fields (uin, nickname, avatar) and possibly session
+        // cookies on error paths. Release logs must stay credential-free.
+        #[cfg(debug_assertions)]
         eprintln!(
-            "[QQMusic] vip_status GetLoginInfo回退响应: {}",
-            &resp_summary[..resp_summary.len().min(800)]
+            "[QQMusic] vip_status GetLoginInfo回退: body_length={}",
+            value.to_string().len()
         );
 
         // 检查 req_1.code
@@ -3768,7 +4122,8 @@ async fn try_get_vip_from_login_info(
         let data = value.get("req_1").and_then(|r| r.get("data"));
 
         if let Some(data) = data {
-            // 打印 data 的所有 key 用于调试
+            // 仅调试模式打印 data 的 key 列表（无值），release 保持安静。
+            #[cfg(debug_assertions)]
             if let Some(obj) = data.as_object() {
                 let keys: Vec<&String> = obj.keys().collect();
                 eprintln!("[QQMusic] vip_status GetLoginInfo data keys = {:?}", keys);
@@ -4035,6 +4390,123 @@ mod tests {
             Some("secret-value==")
         );
         assert!(qqmusic_credential_is_complete(cookie));
+    }
+
+    #[test]
+    fn accepts_wechat_qqmusic_session_identity() {
+        let cookie = "wxuin=o0098765; qm_keyst=wechat-session==; wxopenid=openid; wxunionid=unionid; wxrefresh_token=refresh";
+
+        assert_eq!(extract_cookie_value(cookie).as_deref(), Some("98765"));
+        assert!(qqmusic_credential_is_complete(cookie));
+    }
+
+    #[test]
+    fn rejects_partial_wechat_qqmusic_session_identity() {
+        let cookie = "wxuin=o0098765; qm_keyst=wechat-session==; wxunionid=unionid";
+
+        assert!(!qqmusic_credential_is_complete(cookie));
+    }
+
+    #[test]
+    fn builds_authenticated_comm_for_wechat_session() {
+        let config = ResolvedQQMusicSourceConfig {
+            enabled: true,
+            base_url: QQMUSIC_DEFAULT_BASE_URL.to_string(),
+            token: Some(
+                "wxuin=o0098765; qm_keyst=wechat-session==; wxopenid=openid; wxunionid=unionid; wxrefresh_token=refresh"
+                    .to_string(),
+            ),
+        };
+
+        let comm = build_qqmusic_comm(&config);
+        assert_eq!(
+            comm.get("uin").and_then(|value| value.as_str()),
+            Some("98765")
+        );
+        assert_eq!(
+            comm.get("authst").and_then(|value| value.as_str()),
+            Some("wechat-session==")
+        );
+        assert_eq!(
+            comm.get("platform").and_then(|value| value.as_str()),
+            Some("yqq.json")
+        );
+        assert!(comm
+            .get("g_tk_new_20200303")
+            .and_then(|value| value.as_u64())
+            .is_some_and(|value| value > 0));
+    }
+
+    #[test]
+    fn builds_modern_vkey_request_values_without_exposing_other_credentials() {
+        let config = ResolvedQQMusicSourceConfig {
+            enabled: true,
+            base_url: QQMUSIC_DEFAULT_BASE_URL.to_string(),
+            token: Some(
+                "uin=o0012345; qm_keyst=session-key; psrf_qqaccess_token=private".to_string(),
+            ),
+        };
+        let comm = build_qqmusic_vkey_comm(&config);
+
+        assert_eq!(
+            comm.get("uin").and_then(|value| value.as_str()),
+            Some("12345")
+        );
+        assert_eq!(comm.get("ct").and_then(|value| value.as_i64()), Some(24));
+        assert_eq!(comm.get("cv").and_then(|value| value.as_i64()), Some(0));
+        assert_eq!(
+            comm.get("authst").and_then(|value| value.as_str()),
+            Some("session-key")
+        );
+        assert!(!comm.to_string().contains("private"));
+        assert_eq!(
+            qqmusic_modern_filenames("standard", "song-mid", None),
+            vec![
+                "C400song-midsong-mid.m4a".to_string(),
+                "M500song-midsong-mid.mp3".to_string()
+            ]
+        );
+        assert_eq!(
+            qqmusic_modern_filenames("exhigh", "song-mid", Some("media-mid")),
+            vec![
+                "M800media-mid.mp3".to_string(),
+                "C600media-mid.m4a".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_trusted_https_urls_from_modern_vkey_response() {
+        let response = serde_json::json!({
+            "req": { "data": { "sip": ["http://isure.stream.qqmusic.qq.com/"] } }
+        });
+        let data = serde_json::json!({});
+        let urls =
+            qqmusic_vkey_candidate_urls(&response, &data, "C400song-midsong-mid.m4a?vkey=test");
+
+        assert_eq!(
+            urls,
+            vec!["https://isure.stream.qqmusic.qq.com/C400song-midsong-mid.m4a?vkey=test"]
+        );
+    }
+
+    #[test]
+    fn preserves_media_mid_in_search_track_identity() {
+        let song = source_song_from_qqmusic_search_json(&serde_json::json!({
+            "songmid": "song-mid",
+            "songname": "Rain",
+            "singer": [{ "name": "Singer" }],
+            "albumname": "Album",
+            "albummid": "album-mid",
+            "interval": 200,
+            "file": { "media_mid": "media-mid" }
+        }));
+
+        assert_eq!(song.id, "song-mid|media-mid");
+        assert_eq!(
+            qqmusic_song_id_parts(&song.id),
+            ("song-mid", Some("media-mid"))
+        );
     }
 
     #[test]
