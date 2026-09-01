@@ -55,6 +55,39 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+      - name: cargo test
+        run: cargo test --workspace
+
+  rust-windows:
+    name: Rust checks (Windows)
+    # The QQ Music WebView2 cookie extraction code lives under
+    # [target.'cfg(windows)'.dependencies] and is never compiled on Linux.
+    # A Windows job is required so that Windows-only code is type-checked and
+    # tested before every merge (this is the core of the QQ Music sign-in).
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: cargo check
+        run: cargo check --workspace
+
+      - name: cargo test
+        run: cargo test --workspace
+
   frontend:
     name: Frontend checks
     runs-on: ubuntu-latest

@@ -4,7 +4,71 @@ This project follows small, traceable releases. Keep entries short and focused o
 
 ## [Unreleased]
 
-- No unreleased changes yet.
+> Status: release candidate work — v0.4.0 will be tagged only after manual
+> acceptance (QQ/WeChat scan sign-in, NetEase session stability, window
+> matrix, installer) and a maintainer merge of PR #15. The entries below
+> describe what is already implemented and verified by automated checks.
+
+### Added
+
+- **QQ Music source (PR #15, by @chinoshizuyuki)**: search, playback with
+  per-quality fallback (Hi-Res → Lossless → EXHigh → Higher → Standard) and
+  multi-CDN candidates, lyrics + translated lyrics, playlists, liked songs,
+  user profile, VIP status, QR login, Cookie import, and an official
+  QQ Music WebView2 sign-in window (QQ + WeChat) whose session is validated
+  and persisted entirely inside Rust (Windows Credential Manager).
+- Source settings isolation: each music source (NetEase / Bilibili / QQ
+  Music) is saved and enabled independently; enabling a source never resets
+  the others, and signing in never silently enables a source.
+- Startup only initializes *enabled* sources; disabled sources start no
+  services and open no login checks.
+- Compact player layout at 900px with a shared side-padding baseline;
+  previously the 1040px minimum window inherited a wide fixed-column layout.
+
+### Changed
+
+- NetEase service startup is single-flight (async lock + re-check), health
+  checks verify the API response shape instead of any HTTP 200, and the
+  bundled runtime becomes optional per user configuration.
+- QQ Music credential handling hardened: QR bootstrap cookies live only in
+  Rust memory, WebView2 cookie extraction is Windows-gated with a domain +
+  name allowlist, logs show only presence/length/booleans, and `debug_dump`
+  is test-only and removed from the command surface.
+- Local library rows that point at missing files are surfaced as
+  `file_missing` instead of silently failing at play time.
+- SQLite runs in WAL mode with a busy timeout; legacy column migrations
+  surface errors instead of swallowing them.
+
+### Fixed
+
+- UTF-8-safe cookie masking and login-redirect HTML extraction (no byte
+  slicing panics on non-ASCII input; release builds abort on panic).
+- QQ Music QR polling lifecycle: polls stop on terminal states, die with the
+  settings panel, and a failed verification shows a real reason instead of a
+  misleading "QR expired".
+- QQ Music VIP status reports "unknown" (membership not confirmed) instead
+  of claiming membership from cookie presence alone.
+- Cover stability: library-row covers for Bilibili / QQ Music keep stable
+  CDN URLs instead of short-lived proxy tokens; failed cover hydration
+  retries instead of permanently falling back.
+- Playback / UI: lyric room renders only a window around the active line;
+  queue rows skip off-screen rendering; the Bilibili atmosphere label stops
+  falsely reporting "Preparing" when only cover art is available; danmaku
+  clears on pause; the title dialog retires when an overlay opens; the
+  settings modal closes on Escape / backdrop and is keyboard-accessible.
+
+### Security
+
+- Known Risk recorded in `SECURITY.md`: the bundled
+  `NeteaseCloudMusicApi → music-metadata → file-type` chain has no
+  non-breaking fix; `npm audit fix --force` would force-downgrade to an
+  unmaintained 3.x line and is therefore prohibited.
+
+### CI
+
+- CI now runs `cargo test` (Linux + Windows) and `npm run test`
+  (static regression guards) on every push/PR; Windows job compiles the
+  WebView2-only QQ Music code that Linux CI cannot reach.
 
 ## [0.3.8] - 2026-07-09
 

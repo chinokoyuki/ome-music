@@ -6,12 +6,19 @@ export default defineConfig({
   clearScreen: false,
   server: {
     port: 1420,
-    strictPort: true
+    strictPort: true,
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {
     target: "es2020",
     minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
-    sourcemap: Boolean(process.env.TAURI_DEBUG)
-  }
+    sourcemap: Boolean(process.env.TAURI_DEBUG),
+  },
+  test: {
+    environment: "jsdom",
+    setupFiles: ["./src/test/setup.ts"],
+    include: ["src/**/*.test.{ts,tsx}"],
+    globals: true,
+    css: false,
+  },
 });

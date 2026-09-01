@@ -23,6 +23,7 @@ Older releases are deprecated and no longer recommended. Always download the lat
 - Play local music from your computer.
 - Search and play available NetEase Cloud Music tracks with your own account session.
 - Use Bilibili as a music and video-atmosphere source.
+- Search and play QQ Music tracks with QR, Cookie, or official WebView2 sign-in (QQ and WeChat).
 - View covers, lyrics, video atmosphere, and gentle danmaku.
 - Keep local listening data on your device.
 
