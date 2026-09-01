@@ -48,6 +48,9 @@ interface NowPlayingHeroProps {
   moreOpen: boolean;
   onOpenMore: () => void;
   onCloseMore: () => void;
+  // Any primary overlay (queue / settings / quick settings / search) being
+  // open must retire the title dialog too, so translucent layers never stack.
+  overlayOpen: boolean;
 }
 
 export function NowPlayingHero({
@@ -75,6 +78,7 @@ export function NowPlayingHero({
   moreOpen,
   onOpenMore,
   onCloseMore,
+  overlayOpen,
 }: NowPlayingHeroProps) {
   const [isTitleExpanded, setTitleExpanded] = useState(false);
   const [likePulse, setLikePulse] = useState(false);
@@ -85,6 +89,12 @@ export function NowPlayingHero({
     setTitleExpanded(false);
     onCloseMore();
   }, [onCloseMore, track?.id]);
+
+  // A primary overlay opening elsewhere (queue / settings / quick settings /
+  // search) retires the title dialog so translucent layers never stack.
+  useEffect(() => {
+    if (overlayOpen) setTitleExpanded(false);
+  }, [overlayOpen]);
 
   useEffect(() => {
     if (!isTitleExpanded) return;
@@ -176,7 +186,7 @@ export function NowPlayingHero({
   const artwork = resolveTrackCover(track);
 
   return (
-    <section className="now-playing-stage relative mx-auto grid w-full max-w-[1780px] grid-cols-1 items-center gap-12 overflow-hidden px-[clamp(2rem,5vw,6rem)] md:grid-cols-[minmax(340px,420px)_minmax(560px,1fr)] md:gap-[clamp(5rem,8vw,9rem)]">
+    <section className="now-playing-stage relative mx-auto grid w-full max-w-[1780px] items-center overflow-visible">
       <div
         data-danmaku-safe-zone="left-visual"
         className="left-visual-stack relative z-10 flex min-w-0 flex-col items-center md:items-start"
@@ -369,7 +379,7 @@ export function NowPlayingHero({
 
       <div
         className={clsx(
-          "fixed inset-0 z-30 bg-[#31180b]/10 backdrop-blur-[3px] transition-opacity duration-300",
+          "fixed inset-0 z-30 bg-[#31180b]/[0.06] backdrop-blur-[1.5px] transition-opacity duration-300",
           isTitleExpanded ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0",
         )}
         onClick={() => setTitleExpanded(false)}
@@ -378,7 +388,7 @@ export function NowPlayingHero({
         <div
           data-danmaku-safe-zone="title-dialog"
           className={clsx(
-            "title-reveal-panel fixed bottom-28 left-[5vw] w-[min(520px,88vw)] rounded-[24px] border border-white/18 bg-[#e4d2c4]/55 px-7 py-6 shadow-[0_28px_80px_rgba(74,33,8,0.24)] backdrop-blur-[28px] transition-[opacity,transform] duration-300",
+            "title-reveal-panel fixed rounded-[20px] border border-white/18 bg-[#e4d2c4]/60 px-5 py-4 shadow-[0_22px_64px_rgba(74,33,8,0.18)] backdrop-blur-[18px] transition-[opacity,transform] duration-300",
             isTitleExpanded
               ? "translate-y-0 scale-100 opacity-100"
               : "translate-y-5 scale-[0.97] opacity-0",
@@ -388,7 +398,7 @@ export function NowPlayingHero({
           <p className="text-[10px] font-black uppercase tracking-[0.2em] text-[#4a2108]/34">
             Now Playing
           </p>
-          <p className="mt-3 text-balance text-[clamp(1.3rem,2.2vw,2rem)] font-extrabold leading-[1.08] text-[#4a2108]/88">
+          <p className="mt-2.5 text-balance text-[clamp(1.2rem,1.7vw,1.65rem)] font-extrabold leading-[1.1] text-[#4a2108]/88">
             {track.title}
           </p>
           <p className="mt-4 text-sm font-semibold text-[#4a2108]/42">
@@ -524,9 +534,32 @@ const LyricsRoom = memo(function LyricsRoom({
     return closest?.text ?? null;
   })();
 
+  // Window size around the active lyric line. Only this slice is rendered as
+  // DOM; out-of-window lines become invisible spacer rows that keep the scroll
+  // extent stable. This bounds DOM nodes + composited layers for very long
+  // lyrics (300+ lines) while the visual arc stage stays identical.
+  const LYRIC_WINDOW_RADIUS = 12;
+  const LYRIC_ROW_HEIGHT_PX = 136; // mirrors .lyric-room-line min-height (8.5rem)
+
+  const visualWindow = useMemo(() => {
+    if (lyrics.length === 0) {
+      return { start: 0, end: 0, beforeLines: 0, afterLines: 0, lines: [] as LyricLine[] };
+    }
+    const start = Math.max(0, currentLyricIndex - LYRIC_WINDOW_RADIUS);
+    const end = Math.min(lyrics.length, currentLyricIndex + LYRIC_WINDOW_RADIUS + 1);
+    return {
+      start,
+      end,
+      beforeLines: start,
+      afterLines: lyrics.length - end,
+      lines: lyrics.slice(start, end),
+    };
+  }, [currentLyricIndex, lyrics]);
+
   const visualLines = useMemo(
     () =>
-      lyrics.map((line, index) => {
+      visualWindow.lines.map((line, offsetInWindow) => {
+        const index = visualWindow.start + offsetInWindow;
         const offset = index - currentLyricIndex;
         const distance = Math.abs(offset);
         const signed = offset === 0 ? 0 : Math.sign(offset);
@@ -554,7 +587,7 @@ const LyricsRoom = memo(function LyricsRoom({
           transform: `translate3d(${curveX}px, ${curveY}px, ${zDepth}px) rotateX(${rotateX}deg) rotateZ(${-rotateZ * arcDirection}deg) scale(${scale})`,
         };
       }),
-    [currentLyricIndex, lyrics, preset],
+    [currentLyricIndex, preset, visualWindow],
   );
 
   return (
@@ -564,6 +597,13 @@ const LyricsRoom = memo(function LyricsRoom({
         className="lyrics-scroll h-[58vh] touch-pan-y overflow-y-auto overflow-x-visible overscroll-contain px-2 py-[24vh] pr-8"
         onWheel={(event) => event.stopPropagation()}
       >
+        {visualWindow.beforeLines > 0 && (
+          <div
+            aria-hidden="true"
+            style={{ height: visualWindow.beforeLines * LYRIC_ROW_HEIGHT_PX }}
+            className="w-full shrink-0"
+          />
+        )}
         {visualLines.map(({ line, index, isCurrent, opacity, blur, transform }) => {
           return (
             <button
@@ -594,6 +634,13 @@ const LyricsRoom = memo(function LyricsRoom({
             </button>
           );
         })}
+        {visualWindow.afterLines > 0 && (
+          <div
+            aria-hidden="true"
+            style={{ height: visualWindow.afterLines * LYRIC_ROW_HEIGHT_PX }}
+            className="w-full shrink-0"
+          />
+        )}
       </div>
 
       {/* Hidden Lyric Tools — sit at the bottom-right corner of the stage.
@@ -788,11 +835,13 @@ function BilibiliVideoAtmosphere({
       <div className="pointer-events-none absolute bottom-6 left-7 right-7 z-30 flex items-end justify-between gap-4">
         <p className="text-[10px] font-black uppercase tracking-[0.22em] text-white/56">
           Bilibili ·{" "}
-          {videoReady
-            ? "Video Atmosphere"
-            : videoFailed
-              ? "Cover Atmosphere"
-              : "Preparing Atmosphere"}
+          {!src
+            ? "Cover Atmosphere"
+            : videoReady
+              ? "Video Atmosphere"
+              : videoFailed
+                ? "Cover Atmosphere"
+                : "Preparing Atmosphere"}
         </p>
         {videoFailed && (
           <p className="text-[10px] font-semibold text-white/42">Video stream unavailable</p>

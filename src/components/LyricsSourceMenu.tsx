@@ -272,7 +272,7 @@ export function LyricsSourceMenu({
                     : qqmusicLoginStatus?.status === "expired"
                       ? "请重新登录"
                       : qqmusicLoginStatus?.credentialPresent
-                        ? "登录待验证"
+                        ? "会话已保存"
                         : qqmusicConfig?.enabled
                           ? "公共内容可用"
                           : "关闭"

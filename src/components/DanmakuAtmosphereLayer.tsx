@@ -89,6 +89,12 @@ export function DanmakuAtmosphereLayer({
     if (!displayInVideo) setFloating([]);
   }, [displayInVideo]);
 
+  // Pause = silence: clear freeze-framed comments the moment playback stops
+  // so the video atmosphere reads clean during a pause (see Global layer).
+  useEffect(() => {
+    if (!isPlaying) setFloating([]);
+  }, [isPlaying]);
+
   useEffect(() => {
     if (!displayInVideo || !isPlaying || items.length === 0) return;
 

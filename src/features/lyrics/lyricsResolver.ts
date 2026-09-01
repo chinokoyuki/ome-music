@@ -57,7 +57,7 @@ export async function saveLyricOffset(cacheKey: string, offsetMs: number): Promi
   await invoke("save_lyric_offset", { payload: { cacheKey, offsetMs } });
 }
 
-export function parseLrc(rawLyrics: string): LyricLine[] {
+export function parseLrc(rawLyrics: string, track?: Pick<Track, "title" | "artist">): LyricLine[] {
   const lines: LyricLine[] = [];
 
   rawLyrics.split(/\r?\n/).forEach((rawLine, rawIndex) => {
@@ -70,9 +70,11 @@ export function parseLrc(rawLyrics: string): LyricLine[] {
       const seconds = Number(match[2] || 0);
       const fraction = match[3] ?? "0";
       const millis = Number(fraction.padEnd(3, "0").slice(0, 3));
+      const startTime = minutes * 60 + seconds + millis / 1000;
+      if (isLyricMetadataLine(text, startTime, track)) return;
       lines.push({
         id: `${rawIndex}-${tagIndex}-${minutes}-${seconds}-${millis}`,
-        startTime: minutes * 60 + seconds + millis / 1000,
+        startTime,
         text,
       });
     });
@@ -90,7 +92,7 @@ export function getCurrentLyricIndex(
   const adjustedTime = currentTimeSeconds + offsetMs / 1000;
   let low = 0;
   let high = lines.length - 1;
-  let result = 0;
+  let result = -1;
 
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
@@ -103,6 +105,35 @@ export function getCurrentLyricIndex(
   }
 
   return result;
+}
+
+const lyricCreditPattern =
+  /^(?:作词|填词|词|作曲|曲|编曲|制作人|监制|混音|母带|和声|演唱|歌手|录音|吉他|贝斯|鼓|弦乐|出品|发行|op|sp|lyrics?|composer|arranger|producer|vocal|mixed by|mastered by)\s*[:：]/i;
+
+function isLyricMetadataLine(
+  text: string,
+  startTime: number,
+  track?: Pick<Track, "title" | "artist">,
+): boolean {
+  if (startTime > 20) return false;
+  if (lyricCreditPattern.test(text.trim())) return true;
+  if (!track?.title || !track.artist) return false;
+
+  const normalizedText = normalizeLyricIdentity(text);
+  const normalizedTitle = normalizeLyricIdentity(track.title);
+  const normalizedArtist = normalizeLyricIdentity(track.artist);
+  const hasTitleArtistSeparator = /[-—–·|｜()（）]/.test(text);
+  return (
+    hasTitleArtistSeparator &&
+    normalizedTitle.length >= 2 &&
+    normalizedArtist.length >= 2 &&
+    normalizedText.includes(normalizedTitle) &&
+    normalizedText.includes(normalizedArtist)
+  );
+}
+
+function normalizeLyricIdentity(value: string): string {
+  return value.toLocaleLowerCase().replace(/[\s\-—–·|｜()（）【】\[\]《》]/g, "");
 }
 
 export function lyricCacheKeyForTrack(track: Track): string {

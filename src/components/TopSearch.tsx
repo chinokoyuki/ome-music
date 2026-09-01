@@ -1,15 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
-import { ChevronDown, Loader2, Music2, RefreshCw, Search, Settings, X } from "lucide-react";
+import { ChevronDown, Loader2, Music2, RefreshCw, Search, X } from "lucide-react";
 import {
   BilibiliMusicProvider,
-  ensureNeteaseApiService,
-  getBilibiliSourceConfig,
-  getNeteaseSourceConfig,
-  getQQMusicSourceConfig,
+  getMusicSourceAvailability,
   NetEaseMusicProvider,
   QQMusicProvider,
+  subscribeToMusicSourceConfig,
   waitForNeteaseServiceReady,
+  type MusicSourceAvailability,
   type MusicSourceSong,
 } from "../features/musicSources/provider";
 import type { Track } from "../types/music";
@@ -29,7 +28,6 @@ interface TopSearchProps {
   onPlayNetEase: (song: MusicSourceSong) => Promise<void | boolean>;
   onPlayBilibili: (song: MusicSourceSong) => Promise<void | boolean>;
   onPlayQQMusic: (song: MusicSourceSong) => Promise<void | boolean>;
-  onOpenSettings?: () => void;
 }
 
 export function TopSearch({
@@ -38,22 +36,22 @@ export function TopSearch({
   onPlayNetEase,
   onPlayBilibili,
   onPlayQQMusic,
-  onOpenSettings,
 }: TopSearchProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const bilibiliPlayRequestRef = useRef<number>(0);
   const closeSoonTimerRef = useRef<number | null>(null);
   const [query, setQuery] = useState("");
   const [isOpen, setOpen] = useState(false);
-  const [neteaseEnabled, setNeteaseEnabled] = useState(false);
-  const [bilibiliEnabled, setBilibiliEnabled] = useState(false);
+  const [sourceAvailability, setSourceAvailability] = useState<MusicSourceAvailability | null>(
+    null,
+  );
+  const sourceRefreshRef = useRef(0);
   const [neteaseResults, setNeteaseResults] = useState<MusicSourceSong[]>([]);
   const [bilibiliResults, setBilibiliResults] = useState<MusicSourceSong[]>([]);
   const [isSearchingSource, setSearchingSource] = useState(false);
   const [isSearchingBilibili, setSearchingBilibili] = useState(false);
   const [neteaseMessage, setNeteaseMessage] = useState<string | null>(null);
   const [bilibiliMessage, setBilibiliMessage] = useState<string | null>(null);
-  const [qqmusicEnabled, setQQMusicEnabled] = useState(false);
   const [qqmusicResults, setQQMusicResults] = useState<MusicSourceSong[]>([]);
   const [isSearchingQQMusic, setSearchingQQMusic] = useState(false);
   const [qqmusicMessage, setQQMusicMessage] = useState<string | null>(null);
@@ -66,6 +64,9 @@ export function TopSearch({
   const [neteaseServiceError, setNeteaseServiceError] = useState<string | null>(null);
   // Increment this token to retry the source warm-up search effect.
   const [neteaseRetryToken, setNeteaseRetryToken] = useState(0);
+  const neteaseEnabled = sourceAvailability?.netease ?? false;
+  const bilibiliEnabled = sourceAvailability?.bilibili ?? false;
+  const qqmusicEnabled = sourceAvailability?.qqmusic ?? false;
 
   const localResults = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -77,35 +78,28 @@ export function TopSearch({
       .slice(0, 8);
   }, [query, tracks]);
 
-  useEffect(() => {
-    let cancelled = false;
-    refreshSourceConfig()
-      .then((config) => {
-        if (!cancelled) setNeteaseEnabled(config.enabled);
-      })
-      .catch(() => {
-        if (!cancelled) setNeteaseEnabled(false);
-      });
-    getBilibiliSourceConfig()
-      .then((config) => {
-        if (!cancelled) setBilibiliEnabled(config.enabled);
-      })
-      .catch(() => {
-        if (!cancelled) setBilibiliEnabled(false);
-      });
-    getQQMusicSourceConfig()
-      .then((config) => {
-        if (!cancelled) setQQMusicEnabled(config.enabled);
-      })
-      .catch(() => {
-        if (!cancelled) setQQMusicEnabled(false);
-      });
-    return () => {
-      cancelled = true;
-    };
+  const refreshSourceAvailability = useCallback(async () => {
+    const requestId = sourceRefreshRef.current + 1;
+    sourceRefreshRef.current = requestId;
+    // A stale snapshot must never launch searches while fresh settings are loading.
+    setSourceAvailability(null);
+    setNeteaseResults([]);
+    setBilibiliResults([]);
+    setQQMusicResults([]);
+    try {
+      const availability = await getMusicSourceAvailability();
+      if (sourceRefreshRef.current === requestId) setSourceAvailability(availability);
+    } catch {
+      if (sourceRefreshRef.current === requestId) {
+        setSourceAvailability({ netease: false, bilibili: false, qqmusic: false });
+      }
+    }
   }, []);
 
-  const refreshSourceConfig = () => getNeteaseSourceConfig();
+  useEffect(() => {
+    void refreshSourceAvailability();
+    return subscribeToMusicSourceConfig(() => void refreshSourceAvailability());
+  }, [refreshSourceAvailability]);
 
   useEffect(() => {
     const term = query.trim();
@@ -126,20 +120,16 @@ export function TopSearch({
       // NetEase may still be warming up right after QR login or first launch.
       // Wait briefly in the UI instead of failing silently.
       try {
-        const status = await ensureNeteaseApiService();
+        setNeteaseServiceStarting(true);
+        const status = await waitForNeteaseServiceReady();
         if (cancelled) return;
+        setNeteaseServiceStarting(false);
         if (status.stage !== "ready") {
-          setNeteaseServiceStarting(true);
-          const waited = await waitForNeteaseServiceReady();
-          if (cancelled) return;
-          setNeteaseServiceStarting(false);
-          if (waited.stage !== "ready") {
-            setNeteaseResults([]);
-            setNeteaseServiceError(
-              waited.message || "网易云音乐源暂时不可用 / NetEase source is unavailable right now.",
-            );
-            return;
-          }
+          setNeteaseResults([]);
+          setNeteaseServiceError(
+            status.message || "网易云音乐源暂时不可用 / NetEase source is unavailable right now.",
+          );
+          return;
         }
       } catch (error) {
         if (cancelled) return;
@@ -288,15 +278,7 @@ export function TopSearch({
           onChange={(event) => setQuery(event.target.value)}
           onFocus={() => {
             setOpen(true);
-            void refreshSourceConfig()
-              .then((config) => setNeteaseEnabled(config.enabled))
-              .catch(() => setNeteaseEnabled(false));
-            void getBilibiliSourceConfig()
-              .then((config) => setBilibiliEnabled(config.enabled))
-              .catch(() => setBilibiliEnabled(false));
-            void getQQMusicSourceConfig()
-              .then((config) => setQQMusicEnabled(config.enabled))
-              .catch(() => setQQMusicEnabled(false));
+            void refreshSourceAvailability();
           }}
           onBlur={closeSoon}
           placeholder="Find a song for this moment..."
@@ -356,14 +338,9 @@ export function TopSearch({
             )}
           </SearchGroup>
 
-          {query.trim().length >= 2 && (
+          {query.trim().length >= 2 && neteaseEnabled && (
             <SearchGroup title="NetEase Cloud Music">
-              {!neteaseEnabled ? (
-                <SourceDisabledHint
-                  label="网易云音乐源未启用 / NetEase source is off"
-                  onOpenSettings={onOpenSettings}
-                />
-              ) : neteaseServiceStarting ? (
+              {neteaseServiceStarting ? (
                 <div className="flex items-center gap-2 px-2 py-3 text-xs font-semibold text-[#4a2108]/46">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   正在启动网易云音乐源 / Starting NetEase music source...
@@ -449,14 +426,9 @@ export function TopSearch({
             </SearchGroup>
           )}
 
-          {query.trim().length >= 2 && (
+          {query.trim().length >= 2 && bilibiliEnabled && (
             <SearchGroup title="Bilibili">
-              {!bilibiliEnabled ? (
-                <SourceDisabledHint
-                  label="Bilibili 音乐源未启用 / Bilibili source is off"
-                  onOpenSettings={onOpenSettings}
-                />
-              ) : isSearchingBilibili ? (
+              {isSearchingBilibili ? (
                 <div className="flex items-center gap-2 px-2 py-3 text-xs font-semibold text-[#4a2108]/38">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   Searching Bilibili...
@@ -511,14 +483,9 @@ export function TopSearch({
             </SearchGroup>
           )}
 
-          {query.trim().length >= 2 && (
+          {query.trim().length >= 2 && qqmusicEnabled && (
             <SearchGroup title="QQ音乐">
-              {!qqmusicEnabled ? (
-                <SourceDisabledHint
-                  label="QQ音乐源未启用 / QQ Music source is off"
-                  onOpenSettings={onOpenSettings}
-                />
-              ) : isSearchingQQMusic ? (
+              {isSearchingQQMusic ? (
                 <div className="flex items-center gap-2 px-2 py-3 text-xs font-semibold text-[#4a2108]/38">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   Searching QQ音乐…
@@ -641,31 +608,6 @@ function ResultText({ title, subtitle }: { title: string; subtitle: string }) {
 
 function EmptyLine({ text }: { text: string }) {
   return <p className="px-2 py-3 text-xs font-semibold text-[#4a2108]/34">{text}</p>;
-}
-
-function SourceDisabledHint({
-  label,
-  onOpenSettings,
-}: {
-  label: string;
-  onOpenSettings?: () => void;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-3 px-2 py-3">
-      <span className="text-xs font-semibold text-[#4a2108]/38">{label}</span>
-      {onOpenSettings && (
-        <button
-          type="button"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={onOpenSettings}
-          className="app-transition inline-flex items-center gap-1.5 rounded-full bg-[#4a2108]/8 px-2.5 py-1 text-[11px] font-bold text-[#4a2108]/62 hover:bg-[#4a2108]/14 hover:text-[#4a2108]/82"
-        >
-          <Settings className="h-3 w-3" />
-          启用 / Enable
-        </button>
-      )}
-    </div>
-  );
 }
 
 function ShowMoreButton({ onClick }: { onClick: () => void }) {

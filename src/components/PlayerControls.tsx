@@ -94,7 +94,7 @@ export function PlayerControls({
   return (
     <footer
       data-danmaku-safe-zone="controls"
-      className="player-dock-controls fixed bottom-[clamp(1.9rem,4.8vh,4rem)] left-[clamp(2rem,5vw,6rem)] z-30 w-[min(29vw,420px)] min-w-[320px] max-w-[calc(100vw-3rem)] text-[#4a2108]"
+      className="player-dock-controls fixed bottom-[clamp(1.9rem,4.8vh,4rem)] z-30 text-[#4a2108]"
     >
       {/* Dock progress: kept inside the left player column so the room no
           longer reads as a full-width transport bar. */}

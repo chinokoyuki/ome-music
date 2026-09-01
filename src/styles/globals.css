@@ -10,10 +10,31 @@
   --settings-text-disabled: rgba(220, 214, 208, 0.32);
   --settings-panel-bg: rgba(18, 16, 18, 0.58);
   --settings-panel-border: rgba(255, 255, 255, 0.08);
+  --player-side-padding: clamp(1.5rem, 4vw, 3rem);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+@media (min-width: 900px) {
+  :root {
+    --player-side-padding: clamp(1.5rem, 3.5vw, 3.5rem);
+  }
+}
+
+@media (min-width: 1280px) {
+  :root {
+    --player-side-padding: clamp(2rem, 5vw, 6rem);
+  }
+}
+
+/* Queue rows: skip layout/paint for off-viewport rows (hundreds of rows in
+   large libraries) while keeping the full scroll extent. contain-intrinsic
+   size preserves stable scrollbar/scrollHeight behavior. */
+.queue-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
 }
 
 @keyframes ome-shell-arrive {
@@ -113,8 +134,29 @@ button {
   .now-playing-stage {
     min-height: 100svh;
     height: 100svh;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3rem;
+    padding-inline: var(--player-side-padding);
     padding-top: clamp(5.75rem, 9vh, 7rem);
     padding-bottom: clamp(9.25rem, 15vh, 12rem);
+  }
+
+  @media (min-width: 900px) {
+    .now-playing-stage {
+      grid-template-columns: minmax(250px, 32vw) minmax(0, 1fr);
+      gap: clamp(2rem, 4vw, 4rem);
+    }
+
+    .left-visual-stack {
+      justify-self: start;
+    }
+  }
+
+  @media (min-width: 1280px) {
+    .now-playing-stage {
+      grid-template-columns: minmax(340px, 420px) minmax(0, 1fr);
+      gap: clamp(5rem, 8vw, 9rem);
+    }
   }
 
   @media (max-height: 900px) and (min-width: 768px) {
@@ -130,6 +172,10 @@ button {
 
     .left-visual-stack > div:last-child {
       margin-top: 1rem;
+    }
+
+    .left-visual-stack {
+      top: -1rem;
     }
 
     .right-atmosphere-column {
@@ -149,6 +195,10 @@ button {
     .right-atmosphere-column {
       max-height: calc(100svh - 11rem);
     }
+
+    .left-visual-stack {
+      top: -2.5rem;
+    }
   }
 
   .left-visual-stack {
@@ -159,6 +209,7 @@ button {
 
   .right-atmosphere-column {
     width: 100%;
+    min-width: 0;
     justify-self: stretch;
   }
 
@@ -583,6 +634,10 @@ button {
   }
 
   .player-dock-controls {
+    left: var(--player-side-padding);
+    width: min(29vw, 420px);
+    min-width: 320px;
+    max-width: calc(100vw - 3rem);
     filter: drop-shadow(0 12px 28px rgba(74, 33, 8, 0.08));
   }
 
@@ -865,6 +920,9 @@ button {
   }
 
   .title-reveal-panel {
+    left: var(--player-side-padding);
+    bottom: clamp(15rem, 32vh, 20rem);
+    width: min(420px, calc(100vw - 3rem));
     transition-timing-function: cubic-bezier(0.22, 1.24, 0.36, 1);
   }
 }

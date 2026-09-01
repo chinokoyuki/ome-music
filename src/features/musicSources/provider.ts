@@ -59,13 +59,12 @@ export interface QQMusicLoginStatus {
 export interface QQMusicQrLogin {
   url: string;
   key: string;
-  cookies: string;
 }
 
 export interface QQMusicQrCheck {
   status: "waiting" | "scanned" | "confirmed" | "expired" | "failed";
-  cookie?: string;
   message?: string;
+  loginStatus?: QQMusicLoginStatus;
 }
 
 export interface QQMusicMembership {
@@ -321,7 +320,8 @@ export interface NetEaseUserProfile {
   vip?: NetEaseVipStatus | null;
 }
 
-export type LoginMethod = "qr" | "password" | "phone_sms" | "cookie_import" | "webview_login";
+export type LoginMethod =
+  "qr" | "wechat_qr" | "password" | "phone_sms" | "cookie_import" | "webview_login";
 
 export type SourceLoginStatus =
   | "idle"
@@ -410,12 +410,53 @@ export interface NetEaseAuthProvider {
   openSecureWebLogin(): Promise<SourceConnectionMessage>;
 }
 
+export type MusicSourceId = "netease" | "bilibili" | "qqmusic";
+
+export interface MusicSourceAvailability {
+  netease: boolean;
+  bilibili: boolean;
+  qqmusic: boolean;
+}
+
+export const MUSIC_SOURCE_CONFIG_CHANGED_EVENT = "ome:music-source-config-changed";
+
+function publishMusicSourceConfigChanged(source: MusicSourceId, enabled: boolean): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent(MUSIC_SOURCE_CONFIG_CHANGED_EVENT, {
+      detail: { source, enabled },
+    }),
+  );
+}
+
+export function subscribeToMusicSourceConfig(listener: () => void): () => void {
+  if (typeof window === "undefined") return () => undefined;
+
+  window.addEventListener(MUSIC_SOURCE_CONFIG_CHANGED_EVENT, listener);
+  return () => window.removeEventListener(MUSIC_SOURCE_CONFIG_CHANGED_EVENT, listener);
+}
+
+export async function getMusicSourceAvailability(): Promise<MusicSourceAvailability> {
+  const [netease, bilibili, qqmusic] = await Promise.all([
+    getNeteaseSourceConfig(),
+    getBilibiliSourceConfig(),
+    getQQMusicSourceConfig(),
+  ]);
+  return {
+    netease: netease.enabled,
+    bilibili: bilibili.enabled,
+    qqmusic: qqmusic.enabled,
+  };
+}
+
 const emptyConfig: MusicSourceConfig = {
   enabled: false,
   baseUrl: "",
   hasToken: false,
   maskedToken: "",
 };
+
+let neteaseServiceReadyRequest: Promise<NetEaseServiceStatus> | null = null;
 
 export async function getNeteaseSourceConfig(): Promise<MusicSourceConfig> {
   if (!isTauriRuntime()) {
@@ -438,17 +479,17 @@ export async function ensureNeteaseApiService(): Promise<NetEaseServiceStatus> {
     };
   }
 
-  return invoke<NetEaseServiceStatus>("ensure_netease_api_service");
+  if (neteaseServiceReadyRequest) return neteaseServiceReadyRequest;
+  const request = invoke<NetEaseServiceStatus>("ensure_netease_api_service");
+  const tracked = request.finally(() => {
+    if (neteaseServiceReadyRequest === tracked) neteaseServiceReadyRequest = null;
+  });
+  neteaseServiceReadyRequest = tracked;
+  return tracked;
 }
 
-export async function waitForNeteaseServiceReady(maxWaitMs = 15000): Promise<NetEaseServiceStatus> {
-  const start = Date.now();
-  let status = await ensureNeteaseApiService();
-  while (status.stage !== "ready" && status.stage !== "failed" && Date.now() - start < maxWaitMs) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    status = await ensureNeteaseApiService();
-  }
-  return status;
+export async function waitForNeteaseServiceReady(): Promise<NetEaseServiceStatus> {
+  return ensureNeteaseApiService();
 }
 
 export async function openExternalUrl(url: string): Promise<void> {
@@ -472,10 +513,13 @@ export async function saveNeteaseSourceConfig(
         : readPreviewConfig().maskedToken,
     };
     window.localStorage.setItem("ome.source.netease.preview", JSON.stringify(nextConfig));
+    publishMusicSourceConfigChanged("netease", nextConfig.enabled);
     return nextConfig;
   }
 
-  return invoke<MusicSourceConfig>("save_netease_source_config", { payload });
+  const saved = await invoke<MusicSourceConfig>("save_netease_source_config", { payload });
+  publishMusicSourceConfigChanged("netease", saved.enabled);
+  return saved;
 }
 
 export async function testNeteaseSourceConnection(
@@ -520,9 +564,12 @@ export async function saveBilibiliSourceConfig(
       searchScope: payload.searchScope ?? "music",
     };
     window.localStorage.setItem("ome.source.bilibili.preview", JSON.stringify(nextConfig));
+    publishMusicSourceConfigChanged("bilibili", nextConfig.enabled);
     return nextConfig;
   }
-  return invoke<BilibiliSourceConfig>("save_bilibili_source_config", { payload });
+  const saved = await invoke<BilibiliSourceConfig>("save_bilibili_source_config", { payload });
+  publishMusicSourceConfigChanged("bilibili", saved.enabled);
+  return saved;
 }
 
 export async function testBilibiliSourceConnection(
@@ -742,9 +789,12 @@ export async function saveQQMusicSourceConfig(
       searchScope: (payload.searchScope as QQMusicSourceConfig["searchScope"]) ?? "all",
     };
     window.localStorage.setItem("ome.source.qqmusic.preview", JSON.stringify(nextConfig));
+    publishMusicSourceConfigChanged("qqmusic", nextConfig.enabled);
     return nextConfig;
   }
-  return invoke<QQMusicSourceConfig>("save_qqmusic_source_config", { payload });
+  const saved = await invoke<QQMusicSourceConfig>("save_qqmusic_source_config", { payload });
+  publishMusicSourceConfigChanged("qqmusic", saved.enabled);
+  return saved;
 }
 
 export async function testQQMusicSourceConnection(
@@ -855,21 +905,21 @@ export class QQMusicProvider {
 
 export class QQMusicAccountSessionProvider {
   getSupportedLoginMethods(): LoginMethod[] {
-    return ["qr", "cookie_import", "webview_login"];
+    return ["qr", "wechat_qr", "cookie_import", "webview_login"];
   }
 
   async createQrLogin(): Promise<QQMusicQrLogin> {
     if (!isTauriRuntime()) {
-      return { url: "https://y.qq.com/", key: "preview", cookies: "" };
+      return { url: "https://y.qq.com/", key: "preview" };
     }
     return invoke<QQMusicQrLogin>("create_qqmusic_qr_login");
   }
 
-  async checkQrLoginStatus(key: string, cookies: string): Promise<QQMusicQrCheck> {
+  async checkQrLoginStatus(key: string): Promise<QQMusicQrCheck> {
     if (!isTauriRuntime()) {
       return { status: "waiting", message: "Waiting for scan." };
     }
-    return invoke<QQMusicQrCheck>("check_qqmusic_qr_login", { payload: { key, cookies } });
+    return invoke<QQMusicQrCheck>("check_qqmusic_qr_login", { payload: { key } });
   }
 
   async importCookie(cookie: string): Promise<QQMusicLoginStatus> {
@@ -887,16 +937,27 @@ export class QQMusicAccountSessionProvider {
     return invoke<QQMusicLoginStatus>("import_qqmusic_token", { payload: { cookie } });
   }
 
-  /** 打开 QQ 音乐 webview 登录窗口 */
-  async openWebviewLogin(): Promise<void> {
+  /** Open the official QQ Music page in an isolated sign-in window. */
+  async openWebviewLogin(mode: "qq" | "wechat" = "qq"): Promise<void> {
     if (!isTauriRuntime()) return;
-    return invoke<void>("open_qqmusic_webview_login");
+    return invoke<void>("open_qqmusic_webview_login", { payload: { mode } });
   }
 
-  /** 从 webview 窗口提取 cookie */
-  async extractWebviewCookie(): Promise<string> {
-    if (!isTauriRuntime()) return "";
-    return invoke<string>("extract_qqmusic_webview_cookie");
+  /** Validate and persist the WebView session entirely inside Rust. */
+  async importWebviewSession(): Promise<QQMusicLoginStatus> {
+    if (!isTauriRuntime()) {
+      return {
+        loggedIn: false,
+        credentialPresent: false,
+        status: "signed_out",
+        uin: "",
+        nickname: "",
+        avatarUrl: "",
+        vipType: "none",
+        message: "Desktop sign-in is only available in Ome Music.",
+      };
+    }
+    return invoke<QQMusicLoginStatus>("import_qqmusic_webview_session");
   }
 
   /** 关闭 webview 登录窗口 */
@@ -957,14 +1018,6 @@ export class QQMusicAccountSessionProvider {
     if (!isTauriRuntime()) return { ok: true, message: "Connected. QQ Music is ready." };
     return invoke<SourceConnectionMessage>("test_qqmusic_source_connection", {
       payload: { enabled: true, baseUrl: "https://c.y.qq.com" },
-    });
-  }
-
-  async openSecureWebLogin(): Promise<SourceConnectionMessage> {
-    if (!isTauriRuntime())
-      return { ok: true, message: "Open QQ Music in your browser, then import Cookie." };
-    return invoke<SourceConnectionMessage>("open_source_web_login", {
-      payload: { source: "qqmusic" },
     });
   }
 }

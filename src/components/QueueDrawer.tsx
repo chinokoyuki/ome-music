@@ -152,7 +152,7 @@ export function QueueDrawer({
                 };
 
                 return (
-                  <li key={track.id}>
+                  <li key={track.id} className="queue-row">
                     <div
                       role="button"
                       tabIndex={0}

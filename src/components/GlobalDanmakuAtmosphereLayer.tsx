@@ -71,6 +71,14 @@ export function GlobalDanmakuAtmosphereLayer({
     if (!isAmbient) setLines([]);
   }, [isAmbient]);
 
+  // Pause = silence: freeze-frame leftover danmaku lines would linger over
+  // the artwork while the music is stopped, violating the quiet-idle
+  // principle. Clear the stage the moment playback pauses; it refills from
+  // the item window when playback resumes.
+  useEffect(() => {
+    if (!isPlaying) setLines([]);
+  }, [isPlaying]);
+
   useEffect(() => {
     if (!isAmbient || lines.length === 0) return;
     const frame = window.requestAnimationFrame(() => {
