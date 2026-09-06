@@ -1580,6 +1580,17 @@ async fn check_qqmusic_qr_login(
         .ok_or("QR session expired. Generate a new code.")?;
     let result = qqmusic::check_qqmusic_qr(&payload.key, &cookies).await?;
 
+    // 每次 poll 后把服务端刷新/新增的 cookie 回流到 session map，
+    // 保证下一次 poll 携带同一组不断更新的登录 cookie（qr session continuity）。
+    // 例如 pt_login_sig、qrsig 等由服务器在每次响应中刷新时，下一轮必须用新值。
+    if let Some(updated_cookies) = result.cookies.as_deref() {
+        if !updated_cookies.is_empty() && updated_cookies != cookies {
+            if let Ok(mut sessions) = state.qqmusic_qr_sessions.lock() {
+                sessions.insert(payload.key.clone(), updated_cookies.to_string());
+            }
+        }
+    }
+
     let terminal = matches!(result.status.as_str(), "confirmed" | "expired" | "failed");
     // Capture an import/verification failure as a terminal `failed` state so
     // the frontend can show a real reason and STOP polling. Returning Err here

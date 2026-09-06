@@ -258,6 +258,10 @@ pub struct QQMusicQrCheckDto {
     pub status: String, // "waiting" | "scanned" | "confirmed" | "expired" | "failed"
     pub cookie: Option<String>,
     pub message: Option<String>,
+    /// 每次 poll 后最新累积的登录 cookie（含本轮的 Set-Cookie 回流）。
+    /// 即使状态仍为 waiting/scanned 也返回，供 Rust 侧 session map 更新，
+    /// 保证连续 poll 共享同一组不断更新的 cookie（qr session continuity）。
+    pub cookies: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,6 +342,106 @@ fn extract_cookie_raw(cookie: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 单个 cookie 条目（仅 name/value；attributes 在解析时剥离）。
+/// 最终发送请求时只构造 `name=value; name=value`，绝不把
+/// Expires/Path/Domain/HttpOnly/Secure/SameSite 作为 cookie 值发回服务器。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CookieEntry {
+    pub name: String,
+    pub value: String,
+}
+
+impl CookieEntry {
+    /// 把单条 Set-Cookie 头拆成 name/value。
+    /// 关键：value 可能包含 `=`（base64 填充，例如 qm_keyst/qqmusic_key），
+    /// 必须用 `split_once('=')` 而不是 `split('=').nth(1)`——后者会把
+    /// `qm_keyst=abc==` 截断成 `abc`，导致保存的凭据损坏、后续 verify 失败。
+    pub fn from_set_cookie(raw: &str) -> Option<Self> {
+        let name_value = raw.split(';').next()?.trim();
+        if name_value.is_empty() {
+            return None;
+        }
+        let (name, value) = name_value.split_once('=')?;
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        // 保留 value 原样（含内部 `=`），仅去首尾空白。
+        Some(CookieEntry {
+            name: name.to_string(),
+            value: value.trim().to_string(),
+        })
+    }
+}
+
+/// 把 Cookie header 格式（`a=1; b=2`）解析为条目列表。
+pub(crate) fn parse_cookie_header(cookie: &str) -> Vec<CookieEntry> {
+    cookie
+        .split(';')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let (name, value) = part.split_once('=')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(CookieEntry {
+                name: name.to_string(),
+                value: value.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// 合并 cookie 条目列表为发送用的 Cookie header 字符串。
+/// 规则：
+///   - 同名 cookie 后面的覆盖前面的；
+///   - 空 value 的条目（服务器删除 cookie 的 Set-Cookie: name=; Expires=...）
+///     跳过：不清除旧值（登录过程中服务器可能先发空值再发新值，或仅删除
+///     其他域的同名 cookie；按主键名合并时保留最近的有效值更安全）；
+///   - 顺序保持首次出现的顺序（新有效的同名条目原地替换值）。
+pub(crate) fn merge_cookie_entries(entries: Vec<CookieEntry>) -> String {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for entry in entries {
+        if entry.value.is_empty() {
+            continue;
+        }
+        if !map.contains_key(&entry.name) {
+            order.push(entry.name.clone());
+        }
+        map.insert(entry.name.clone(), entry.value);
+    }
+    order
+        .into_iter()
+        .filter_map(|name| map.get(&name).map(|value| format!("{name}={value}")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// 把一个 Set-Cookie 头列表合并进现有 cookie header 字符串（QQ 登录链）。
+/// returns: 更新后的 cookie header。
+pub(crate) fn merge_set_cookie_header(existing: &str, set_cookies: &[String]) -> String {
+    let mut entries = parse_cookie_header(existing);
+    for raw in set_cookies {
+        if let Some(entry) = CookieEntry::from_set_cookie(raw) {
+            // 同名替换（保持原位置），空值跳过（不清除有效旧值）。
+            if entry.value.is_empty() {
+                continue;
+            }
+            if let Some(slot) = entries.iter_mut().find(|e| e.name == entry.name) {
+                slot.value = entry.value;
+            } else {
+                entries.push(entry);
+            }
+        }
+    }
+    merge_cookie_entries(entries)
 }
 
 /// 提取 QQ 音乐签名 key / Extract QQ Music signing key
@@ -1963,7 +2067,7 @@ fn extract_cookie_value(cookie: &str) -> Option<String> {
             if !part.to_lowercase().starts_with(&prefix) {
                 continue;
             }
-            if let Some(val) = part.split('=').nth(1) {
+            if let Some((_, val)) = part.split_once('=') {
                 let cleaned = val
                     .trim()
                     .trim_start_matches('o')
@@ -2383,6 +2487,65 @@ pub async fn verify_qqmusic_session(
 
 // ── QR 登录 ──────────────────────────────────────────────────────────
 
+/// QQ ptlogin 二维码状态的显式解析结果。
+/// 状态码来自 ptqrlogin 的 ptuiCB 回调第一参数：
+///   0  = 登录成功（需 follow redirect 拿最终 cookie）
+///   65 = 二维码过期（server 明确告知）
+///   66 = 等待扫码
+///   67 = 已扫码待手机确认
+///   68 = 用户取消
+///   -1 / 其它 = 未知（可能是 rate limit、网络劫持页、反自动化等）
+/// 前端不得根据本地计时伪造 expired——过期与否只以 server 返回为准。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QQQrState {
+    Waiting,
+    Scanned,
+    Confirmed,
+    Expired,
+    Canceled,
+    Unknown,
+}
+
+impl QQQrState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QQQrState::Waiting => "waiting",
+            QQQrState::Scanned => "scanned",
+            QQQrState::Confirmed => "confirmed",
+            QQQrState::Expired => "expired",
+            QQQrState::Canceled => "canceled",
+            QQQrState::Unknown => "unknown",
+        }
+    }
+}
+
+/// 从 ptqrlogin 的 200 响应体解析 ptuiCB 回调状态。
+/// ptuiCB('66','0','...') / ptuiCB("67","0",...) 均可解析；
+/// 无法识别时返回 Unknown（绝不猜测 expired）。
+fn parse_ptui_state(text: &str) -> QQQrState {
+    let body = text.trim();
+    let code = body
+        .split(['\'', '"', '(', ')', ',', ' '])
+        .find_map(|token| {
+            let token = token.trim();
+            if token.is_empty() {
+                return None;
+            }
+            token.parse::<i32>().ok()
+        });
+    match code {
+        Some(0) => QQQrState::Confirmed,
+        Some(65) => QQQrState::Expired,
+        Some(66) => QQQrState::Waiting,
+        Some(67) => QQQrState::Scanned,
+        Some(68) => QQQrState::Canceled,
+        Some(_) => QQQrState::Unknown,
+        // 无数字 token（HTML 验证页 / 反自动化 / 纯文本错误）→ Unknown，
+        // 调用方应继续等待或退避，不能误报 expired。
+        None => QQQrState::Unknown,
+    }
+}
+
 /// 生成 QQ 音乐二维码登录
 pub async fn create_qqmusic_qr() -> Result<QQMusicQrLoginDto, String> {
     let client = reqwest::Client::new();
@@ -2450,15 +2613,14 @@ pub async fn create_qqmusic_qr() -> Result<QQMusicQrLoginDto, String> {
         .collect::<Vec<_>>()
         .join("; ");
 
-    // 合并 xlogin + ptqrshow 的所有 cookie
-    let mut all_cookie_parts: Vec<&str> = Vec::new();
-    for part in xlogin_cookies.split(';').chain(ptqrshow_cookies.split(';')) {
-        let part = part.trim();
-        if !part.is_empty() && !all_cookie_parts.contains(&part) {
-            all_cookie_parts.push(part);
-        }
-    }
-    let all_cookies = all_cookie_parts.join("; ");
+    // 合并 xlogin + ptqrshow 的所有 cookie（同名覆盖，空值跳过）
+    let merged = merge_cookie_entries(
+        parse_cookie_header(&xlogin_cookies)
+            .into_iter()
+            .chain(parse_cookie_header(&ptqrshow_cookies))
+            .collect(),
+    );
+    let all_cookies = merged;
 
     let qrsig = all_cookies
         .split("; ")
@@ -2548,12 +2710,20 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
         .collect::<Vec<_>>()
         .join("; ");
 
+    // 本轮 poll 的最新累积 cookie（原 cookie + 本轮 Set-Cookie 合并）。
+    // 返回给调用方回存 session map，保证下一次 poll 携带最新的
+    // pt_login_sig / qrsig 等由服务器刷新的 cookie（session continuity）。
+    let mut poll_entries = parse_cookie_header(all_cookies);
+    poll_entries.extend(parse_cookie_header(&ptqrlogin_cookies));
+    let current_cookies = merge_cookie_entries(poll_entries);
+
     let resp_status = resp.status();
 
     if resp_status == reqwest::StatusCode::FORBIDDEN {
         return Ok(QQMusicQrCheckDto {
             status: "failed".to_string(),
             cookie: None,
+            cookies: Some(current_cookies),
             message: Some(
                 "QQ 直连扫码当前不可用，请使用官方网页登录 / Direct QR is unavailable; use Official Sign-in."
                     .to_string(),
@@ -2586,19 +2756,11 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
                 follow_qqmusic_login_redirect(&redirect_url, &ptqrlogin_cookies, all_cookies)
                     .await?;
 
-            // 合并所有 cookie（redirect_cookie 已包含全部，这里去重合并）
-            let mut all_parts: Vec<&str> = Vec::new();
-            for part in all_cookies
-                .split(';')
-                .chain(ptqrlogin_cookies.split(';'))
-                .chain(redirect_cookie.split(';'))
-            {
-                let part = part.trim();
-                if !part.is_empty() && !all_parts.contains(&part) {
-                    all_parts.push(part);
-                }
-            }
-            let merged_cookie = all_parts.join("; ");
+            // 合并所有 cookie（同名覆盖，空值跳过，redirect_cookie 优先）
+            let mut entries = parse_cookie_header(all_cookies);
+            entries.extend(parse_cookie_header(&ptqrlogin_cookies));
+            entries.extend(parse_cookie_header(&redirect_cookie));
+            let merged_cookie = merge_cookie_entries(entries);
 
             #[cfg(debug_assertions)]
             eprintln!(
@@ -2610,13 +2772,15 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
 
             return Ok(QQMusicQrCheckDto {
                 status: "confirmed".to_string(),
-                cookie: Some(merged_cookie),
+                cookie: Some(merged_cookie.clone()),
+                cookies: Some(merged_cookie),
                 message: Some("登录成功 / Login successful.".to_string()),
             });
         }
         return Ok(QQMusicQrCheckDto {
             status: "waiting".to_string(),
             cookie: None,
+            cookies: Some(current_cookies),
             message: Some("登录重定向但无目标URL，继续等待".to_string()),
         });
     }
@@ -2648,86 +2812,94 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
 
     // 解析 ptuiCB 回调
     // ptuiCB('0','0','redirect_url','0','login success','nickname')
-    // 状态码: 66=等待扫码, 67=已扫码待确认, 65=过期, 0=成功
-    // 兼容单引号和双引号两种格式 / Compatible with both single and double quote formats
-    let has_66 = text.contains("'66'") || text.contains("\"66\"") || text.contains("(66,");
-    let has_67 = text.contains("'67'") || text.contains("\"67\"") || text.contains("(67,");
-    let has_65 = text.contains("'65'") || text.contains("\"65\"") || text.contains("(65,");
-    let has_0 = text.contains("'0'") || text.contains("\"0\"");
-    eprintln!("[QQMusic] ptqrlogin 状态匹配: 66={has_66}, 67={has_67}, 65={has_65}, 0={has_0}");
+    // 状态码: 66=等待扫码, 67=已扫码待确认, 65=过期, 68=取消, 0=成功
+    // 只信任 server 返回的状态；无法解析时保持等待（Unknown）。
+    let qr_state = parse_ptui_state(&text);
+    eprintln!("[QQAuth][QR_POLL] state={}", qr_state.as_str());
 
-    if has_66 {
-        return Ok(QQMusicQrCheckDto {
-            status: "waiting".to_string(),
-            cookie: None,
-            message: Some("等待扫码 / Waiting for scan.".to_string()),
-        });
-    }
-    if has_67 {
-        return Ok(QQMusicQrCheckDto {
-            status: "scanned".to_string(),
-            cookie: None,
-            message: Some("已扫码，请在手机上确认 / Scanned, please confirm on phone.".to_string()),
-        });
-    }
-    if has_65 {
-        return Ok(QQMusicQrCheckDto {
-            status: "expired".to_string(),
-            cookie: None,
-            message: Some("二维码已过期，请重新生成 / QR code expired.".to_string()),
-        });
-    }
-    if has_0 {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[QQMusic] QR login callback confirmed: cookie_count={}",
-            ptqrlogin_cookies
-                .split(';')
-                .filter(|part| !part.trim().is_empty())
-                .count()
-        );
-
-        // 登录成功 → 合并 ptqrlogin 响应 cookie + 跟随重定向获取的 cookie
-        let redirect_cookie =
-            follow_qqmusic_login_redirect(&text, &ptqrlogin_cookies, all_cookies).await?;
-
-        // 合并所有 cookie: 原始 cookie + ptqrlogin cookie + 重定向 cookie
-        let mut all_parts: Vec<&str> = Vec::new();
-        for part in all_cookies
-            .split(';')
-            .chain(ptqrlogin_cookies.split(';'))
-            .chain(redirect_cookie.split(';'))
-        {
-            let part = part.trim();
-            if !part.is_empty() && !all_parts.contains(&part) {
-                all_parts.push(part);
-            }
+    match qr_state {
+        QQQrState::Waiting => {
+            return Ok(QQMusicQrCheckDto {
+                status: "waiting".to_string(),
+                cookie: None,
+                cookies: Some(current_cookies.clone()),
+                message: Some("等待扫码 / Waiting for scan.".to_string()),
+            });
         }
-        let merged_cookie = all_parts.join("; ");
+        QQQrState::Scanned => {
+            return Ok(QQMusicQrCheckDto {
+                status: "scanned".to_string(),
+                cookie: None,
+                cookies: Some(current_cookies.clone()),
+                message: Some(
+                    "已扫码，请在手机上确认 / Scanned, please confirm on phone.".to_string(),
+                ),
+            });
+        }
+        QQQrState::Expired => {
+            return Ok(QQMusicQrCheckDto {
+                status: "expired".to_string(),
+                cookie: None,
+                cookies: Some(current_cookies.clone()),
+                message: Some("二维码已过期，请重新生成 / QR code expired.".to_string()),
+            });
+        }
+        QQQrState::Canceled => {
+            return Ok(QQMusicQrCheckDto {
+                status: "failed".to_string(),
+                cookie: None,
+                cookies: Some(current_cookies.clone()),
+                message: Some("已取消登录 / Login canceled.".to_string()),
+            });
+        }
+        QQQrState::Confirmed => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[QQMusic] QR login callback confirmed: cookie_count={}",
+                ptqrlogin_cookies
+                    .split(';')
+                    .filter(|part| !part.trim().is_empty())
+                    .count()
+            );
 
-        #[cfg(debug_assertions)]
-        eprintln!(
+            // 登录成功 → 合并 ptqrlogin 响应 cookie + 跟随重定向获取的 cookie
+            let redirect_cookie =
+                follow_qqmusic_login_redirect(&text, &ptqrlogin_cookies, all_cookies).await?;
+
+            // 合并所有 cookie: 原始 cookie + ptqrlogin cookie + 重定向 cookie
+            let mut entries = parse_cookie_header(all_cookies);
+            entries.extend(parse_cookie_header(&ptqrlogin_cookies));
+            entries.extend(parse_cookie_header(&redirect_cookie));
+            let merged_cookie = merge_cookie_entries(entries);
+
+            #[cfg(debug_assertions)]
+            eprintln!(
             "[QQMusic] QR login confirmed: credential_length={}, has_uin={}, has_signing_key={}",
             merged_cookie.len(),
             extract_cookie_value(&merged_cookie).is_some(),
             extract_qqmusic_signing_key(&merged_cookie).is_some()
         );
 
-        return Ok(QQMusicQrCheckDto {
-            status: "confirmed".to_string(),
-            cookie: Some(merged_cookie),
-            message: Some("登录成功 / Login successful.".to_string()),
-        });
+            return Ok(QQMusicQrCheckDto {
+                status: "confirmed".to_string(),
+                cookie: Some(merged_cookie.clone()),
+                cookies: Some(merged_cookie),
+                message: Some("登录成功 / Login successful.".to_string()),
+            });
+        }
+        // 未知响应不立即失败，继续等待扫码（避免临时网络问题导致二维码过早消失）。
+        // 这里不猜测 expired——二维码是否过期只能由 server 的 65 状态决定。
+        QQQrState::Unknown => {
+            return Ok(QQMusicQrCheckDto {
+                status: "waiting".to_string(),
+                cookie: None,
+                cookies: Some(current_cookies.clone()),
+                message: Some(
+                    "登录状态暂时未知，继续等待 / Login status unknown; still waiting.".to_string(),
+                ),
+            });
+        }
     }
-
-    // 未知响应不立即失败，继续等待扫码（避免临时网络问题导致二维码过早消失）
-    Ok(QQMusicQrCheckDto {
-        status: "waiting".to_string(),
-        cookie: None,
-        message: Some(
-            "登录状态暂时未知，继续等待 / Login status unknown; still waiting.".to_string(),
-        ),
-    })
 }
 
 /// 跟随 QQ 登录重定向 URL 获取 cookie
@@ -2791,26 +2963,21 @@ async fn follow_qqmusic_login_redirect(
                 }
             })?;
 
-        // 收集本跳的 Set-Cookie
-        for v in resp.headers().get_all("set-cookie").iter() {
-            if let Ok(s) = v.to_str() {
-                if let Some(name_value) = s.split(';').next() {
-                    let name_value = name_value.trim();
-                    if !name_value.is_empty() {
-                        // 提取 cookie 值，跳过空值（删除 cookie，如 p_skey=; Expires=1970）
-                        // 服务器会先设真实值再发空值删除其他域的同名 cookie，
-                        // 如果不跳过空值，会用空值覆盖之前收集的有效值
-                        let cookie_value = name_value.split('=').nth(1).unwrap_or("");
-                        if cookie_value.is_empty() {
-                            continue;
-                        }
-                        let cookie_name = name_value.split('=').next().unwrap_or("");
-                        accumulated.retain(|a| !a.starts_with(&format!("{cookie_name}=")));
-                        accumulated.push(name_value.to_string());
-                    }
-                }
-            }
-        }
+        // 收集本跳的 Set-Cookie（正确解析：value 可能含 `=`，attributes 剥离，
+        // 空值删除 cookie 不清除有效旧值，同名以新值覆盖）
+        let set_cookie_headers: Vec<String> = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(ToString::to_string))
+            .collect();
+        let mut cookie_header = accumulated.join("; ");
+        cookie_header = merge_set_cookie_header(&cookie_header, &set_cookie_headers);
+        accumulated = cookie_header
+            .split(';')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
 
         // 记算本跳新增的 cookie 数量
         let set_cookie_count = resp.headers().get_all("set-cookie").iter().count();
@@ -2907,22 +3074,19 @@ async fn follow_qqmusic_login_redirect(
             y_set_cookie_count
         );
 
-        for v in resp_y.headers().get_all("set-cookie").iter() {
-            if let Ok(s) = v.to_str() {
-                if let Some(name_value) = s.split(';').next() {
-                    let name_value = name_value.trim();
-                    if !name_value.is_empty() {
-                        let cookie_value = name_value.split('=').nth(1).unwrap_or("");
-                        if cookie_value.is_empty() {
-                            continue;
-                        }
-                        let cookie_name = name_value.split('=').next().unwrap_or("");
-                        accumulated.retain(|a| !a.starts_with(&format!("{cookie_name}=")));
-                        accumulated.push(name_value.to_string());
-                    }
-                }
-            }
-        }
+        let set_cookie_headers: Vec<String> = resp_y
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(ToString::to_string))
+            .collect();
+        let mut cookie_header = accumulated.join("; ");
+        cookie_header = merge_set_cookie_header(&cookie_header, &set_cookie_headers);
+        accumulated = cookie_header
+            .split(';')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
 
         if resp_y.status().is_redirection() {
             if let Some(loc) = resp_y.headers().get("location") {
@@ -3508,22 +3672,19 @@ async fn follow_qqmusic_login_redirect(
                 resp_p.status(),
                 p_set_cookie_count
             );
-            for v in resp_p.headers().get_all("set-cookie").iter() {
-                if let Ok(s) = v.to_str() {
-                    if let Some(name_value) = s.split(';').next() {
-                        let name_value = name_value.trim();
-                        if !name_value.is_empty() {
-                            let cookie_value = name_value.split('=').nth(1).unwrap_or("");
-                            if cookie_value.is_empty() {
-                                continue;
-                            }
-                            let cookie_name = name_value.split('=').next().unwrap_or("");
-                            accumulated.retain(|a| !a.starts_with(&format!("{cookie_name}=")));
-                            accumulated.push(name_value.to_string());
-                        }
-                    }
-                }
-            }
+            let set_cookie_headers: Vec<String> = resp_p
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(ToString::to_string))
+                .collect();
+            let mut cookie_header = accumulated.join("; ");
+            cookie_header = merge_set_cookie_header(&cookie_header, &set_cookie_headers);
+            accumulated = cookie_header
+                .split(';')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect();
         }
     }
 

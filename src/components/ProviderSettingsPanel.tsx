@@ -406,7 +406,9 @@ export function ProviderSettingsPanel({
   // QQ Music QR / VIP / Playlists
   const [qqmusicQr, setQQMusicQr] = useState<QQMusicQrLogin | null>(null);
   const [qqmusicQrStatus, setQQMusicQrStatus] = useState<string>("");
-  const qqmusicQrStartedAtRef = useRef<number>(0);
+  // QR generation guard: incremented on every "New Code"; any async poll
+  // response whose generation is stale is dropped (see poll effect).
+  const qqmusicQrGenerationRef = useRef(0);
   const [qqmusicWebLoginMode, setQQMusicWebLoginMode] = useState<"qq" | "wechat" | null>(null);
   const [, setQQMusicVipStatus] = useState<QQMusicVipStatus | null>(null);
   const [, setQQMusicUserPlaylists] = useState<NetEaseUserPlaylist[]>([]);
@@ -866,38 +868,54 @@ export function ProviderSettingsPanel({
   // NetEase/Bilibili QR flows. This guarantees the poll chain dies when the
   // settings panel unmounts, that a repeated "generate" replaces the old QR
   // session, and that terminal states (confirmed / expired / failed) stop the
-  // poll immediately — no 2-minute zombie timeout chain on an unmounted
-  // component and no misleading "QR expired" after a failed verification.
+  // poll immediately — no zombie timeout chain on an unmounted component and
+  // no misleading "QR expired" after a failed verification.
+  //
+  // QR expiry is decided ONLY by the server's 65 status: the frontend never
+  // fakes "expired" from a local timer. A locally elapsed poll window just
+  // keeps waiting ("polling"), and transient network errors back off and
+  // retry instead of destroying the QR.
   // NOTE: must stay ABOVE the `if (!open) return null` guard — hooks after a
   // conditional early-return violate the rules of hooks.
   useEffect(() => {
     if (!open || !qqmusicQr) return;
     if (
       qqmusicQrStatus === "expired" ||
-      qqmusicQrStatus === "timeout" ||
-      qqmusicQrStatus === "failed"
+      qqmusicQrStatus === "failed" ||
+      qqmusicQrStatus === "confirmed"
     )
       return;
 
+    // Generation guard: every "New Code" bumps this ref through
+    // qqmusicQrGenerationRef (in createQQMusicQr). Any async response from
+    // an older QR generation is dropped, so a stale poll can never update
+    // the new QR's state or overwrite a successful login.
+    const generation = qqmusicQrGenerationRef.current;
     let cancelled = false;
     let inFlight = false;
-    let errorCount = 0;
-    const QQMUSIC_QR_MAX_LIFE_MS = 120_000; // 2 minutes
+    let consecutiveErrors = 0;
+
+    // Backoff schedule for transient errors: 2s, 2s, 3s, 5s, then capped 5s.
+    const backoffDelayMs = () => {
+      const delays = [2000, 2000, 3000, 5000];
+      return delays[Math.min(consecutiveErrors, delays.length - 1)];
+    };
+
+    let timer: number | undefined;
+
+    const scheduleNext = (delayMs: number) => {
+      timer = window.setTimeout(() => void poll(), delayMs);
+    };
 
     const poll = async () => {
       if (cancelled || inFlight) return;
+      if (qqmusicQrGenerationRef.current !== generation) return;
       inFlight = true;
       try {
-        const elapsed = Date.now() - qqmusicQrStartedAtRef.current;
-        if (elapsed > QQMUSIC_QR_MAX_LIFE_MS) {
-          setQQMusicQrStatus("expired");
-          setQQMusicMsg("二维码已过期，请重新生成 / QR code timed out. Regenerate to try again.");
-          return;
-        }
-
         const result = await qqmusicAuthProvider.checkQrLoginStatus(qqmusicQr.key);
         if (cancelled) return;
-        errorCount = 0;
+        if (qqmusicQrGenerationRef.current !== generation) return;
+        consecutiveErrors = 0;
 
         if (result.status === "confirmed") {
           const loginStatus = result.loginStatus;
@@ -916,7 +934,7 @@ export function ProviderSettingsPanel({
           } else {
             // Rust returned confirmed but the session could not be verified.
             // This is terminal — stop polling and show the real reason
-            // instead of retrying for two minutes.
+            // instead of retrying indefinitely.
             setQQMusicQrStatus("failed");
             setQQMusicMsg(
               result.message || "登录确认失败，请重新扫码 / Login confirmation failed. Scan again.",
@@ -929,35 +947,40 @@ export function ProviderSettingsPanel({
         } else if (result.status === "waiting") {
           setQQMusicQrStatus("waiting");
         } else if (result.status === "expired") {
+          // Server-confirmed expiry: the QR is genuinely dead.
           setQQMusicQrStatus("expired");
           return;
         } else if (result.status === "failed") {
+          // Backend terminal failure (canceled / rate_limited / network
+          // verdict from a definitive source). Surface the real reason.
           setQQMusicQrStatus("failed");
           setQQMusicMsg(result.message || "QR login failed.");
           return;
         }
+        scheduleNext(1500);
       } catch (pollErr) {
-        if (!cancelled) {
-          errorCount += 1;
-          if (errorCount >= 5) {
-            setQQMusicQrStatus("failed");
-            setQQMusicMsg(
-              `登录检查失败: ${readError(pollErr)} / QR check failed. Please regenerate.`,
-            );
-          } else {
-            setQQMusicMsg(`轮询中: ${readError(pollErr)} / Polling: ${readError(pollErr)}`);
-          }
+        if (cancelled) return;
+        if (qqmusicQrGenerationRef.current !== generation) return;
+        // Transient network failure: back off and keep polling the SAME QR.
+        // Never convert a network error into "expired".
+        consecutiveErrors += 1;
+        if (consecutiveErrors === 1) {
+          setQQMusicMsg(`轮询中: ${readError(pollErr)} / Polling: ${readError(pollErr)}`);
+        } else {
+          setQQMusicMsg(
+            `网络波动，继续等待: ${readError(pollErr)} / Transient error, still waiting.`,
+          );
         }
+        scheduleNext(backoffDelayMs());
       } finally {
         inFlight = false;
       }
     };
 
     void poll();
-    const timer = window.setInterval(poll, 1500);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [open, qqmusicQr, qqmusicQrStatus, qqmusicEnabled]);
 
@@ -1337,8 +1360,10 @@ export function ProviderSettingsPanel({
     setCreatingQQMusicQr(true);
     setQQMusicMsg(null);
     try {
+      // Bump the generation BEFORE swapping in the new QR so any in-flight
+      // poll from the previous QR is ignored (stale-response guard).
+      qqmusicQrGenerationRef.current += 1;
       const qr = await qqmusicAuthProvider.createQrLogin();
-      qqmusicQrStartedAtRef.current = Date.now();
       setQQMusicQr(qr);
       setQQMusicQrStatus("waiting");
     } catch (error) {
