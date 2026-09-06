@@ -270,13 +270,23 @@ expectMatch(
 );
 expectMatch(
   settings,
-  /qqmusicQrStatus === "expired"\s*\|\|\s*qqmusicQrStatus === "timeout"\s*\|\|\s*qqmusicQrStatus === "failed"/,
+  /qqmusicQrStatus === "expired"\s*\|\|\s*qqmusicQrStatus === "failed"\s*\|\|\s*qqmusicQrStatus === "confirmed"/,
   "QQ Music QR polling must not continue after a terminal state",
 );
 expectMatch(
   settings,
-  /const timer = window\.setInterval\(poll, 1500\);[\s\S]*clearInterval\(timer\)/,
+  /timer = window\.setTimeout\(\(\) => void poll\(\), delayMs\);[\s\S]*window\.clearTimeout\(timer\)/,
   "QQ Music QR polling must live in an effect with cleanup",
+);
+expectMatch(
+  settings,
+  /qqmusicQrGenerationRef\.current \+= 1/,
+  "a new QR must invalidate in-flight polls from the previous QR (stale-response guard)",
+);
+expectMatch(
+  settings,
+  /else if \(result\.status === "expired"\)[\s\S]*setQQMusicQrStatus\("expired"\)/,
+  "QR expiry must be decided by the server, never faked by a local timer",
 );
 
 // 2. Signing in must never silently enable a source, and the login UI must
