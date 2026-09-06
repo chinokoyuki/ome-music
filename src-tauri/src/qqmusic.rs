@@ -2818,40 +2818,30 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
     eprintln!("[QQAuth][QR_POLL] state={}", qr_state.as_str());
 
     match qr_state {
-        QQQrState::Waiting => {
-            return Ok(QQMusicQrCheckDto {
-                status: "waiting".to_string(),
-                cookie: None,
-                cookies: Some(current_cookies.clone()),
-                message: Some("等待扫码 / Waiting for scan.".to_string()),
-            });
-        }
-        QQQrState::Scanned => {
-            return Ok(QQMusicQrCheckDto {
-                status: "scanned".to_string(),
-                cookie: None,
-                cookies: Some(current_cookies.clone()),
-                message: Some(
-                    "已扫码，请在手机上确认 / Scanned, please confirm on phone.".to_string(),
-                ),
-            });
-        }
-        QQQrState::Expired => {
-            return Ok(QQMusicQrCheckDto {
-                status: "expired".to_string(),
-                cookie: None,
-                cookies: Some(current_cookies.clone()),
-                message: Some("二维码已过期，请重新生成 / QR code expired.".to_string()),
-            });
-        }
-        QQQrState::Canceled => {
-            return Ok(QQMusicQrCheckDto {
-                status: "failed".to_string(),
-                cookie: None,
-                cookies: Some(current_cookies.clone()),
-                message: Some("已取消登录 / Login canceled.".to_string()),
-            });
-        }
+        QQQrState::Waiting => Ok(QQMusicQrCheckDto {
+            status: "waiting".to_string(),
+            cookie: None,
+            cookies: Some(current_cookies.clone()),
+            message: Some("等待扫码 / Waiting for scan.".to_string()),
+        }),
+        QQQrState::Scanned => Ok(QQMusicQrCheckDto {
+            status: "scanned".to_string(),
+            cookie: None,
+            cookies: Some(current_cookies.clone()),
+            message: Some("已扫码，请在手机上确认 / Scanned, please confirm on phone.".to_string()),
+        }),
+        QQQrState::Expired => Ok(QQMusicQrCheckDto {
+            status: "expired".to_string(),
+            cookie: None,
+            cookies: Some(current_cookies.clone()),
+            message: Some("二维码已过期，请重新生成 / QR code expired.".to_string()),
+        }),
+        QQQrState::Canceled => Ok(QQMusicQrCheckDto {
+            status: "failed".to_string(),
+            cookie: None,
+            cookies: Some(current_cookies.clone()),
+            message: Some("已取消登录 / Login canceled.".to_string()),
+        }),
         QQQrState::Confirmed => {
             #[cfg(debug_assertions)]
             eprintln!(
@@ -2880,25 +2870,23 @@ pub async fn check_qqmusic_qr(qrsig: &str, all_cookies: &str) -> Result<QQMusicQ
             extract_qqmusic_signing_key(&merged_cookie).is_some()
         );
 
-            return Ok(QQMusicQrCheckDto {
+            Ok(QQMusicQrCheckDto {
                 status: "confirmed".to_string(),
                 cookie: Some(merged_cookie.clone()),
                 cookies: Some(merged_cookie),
                 message: Some("登录成功 / Login successful.".to_string()),
-            });
+            })
         }
         // 未知响应不立即失败，继续等待扫码（避免临时网络问题导致二维码过早消失）。
         // 这里不猜测 expired——二维码是否过期只能由 server 的 65 状态决定。
-        QQQrState::Unknown => {
-            return Ok(QQMusicQrCheckDto {
-                status: "waiting".to_string(),
-                cookie: None,
-                cookies: Some(current_cookies.clone()),
-                message: Some(
-                    "登录状态暂时未知，继续等待 / Login status unknown; still waiting.".to_string(),
-                ),
-            });
-        }
+        QQQrState::Unknown => Ok(QQMusicQrCheckDto {
+            status: "waiting".to_string(),
+            cookie: None,
+            cookies: Some(current_cookies.clone()),
+            message: Some(
+                "登录状态暂时未知，继续等待 / Login status unknown; still waiting.".to_string(),
+            ),
+        }),
     }
 }
 
