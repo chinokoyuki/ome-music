@@ -63,6 +63,14 @@ This project follows small, traceable releases. Keep entries short and focused o
   `NeteaseCloudMusicApi → music-metadata → file-type` chain has no
   non-breaking fix; `npm audit fix --force` would force-downgrade to an
   unmaintained 3.x line and is therefore prohibited.
+- Dependency hardening (2026-09-06): compatible-range `npm audit fix` plus a
+  `vite` 6.4.3 upgrade cleared 9 of the 15 previously reported advisories in
+  both the root tree and the bundled NetEase runtime tree (vite dev-server
+  family, esbuild dev-server, axios 1.18.1, form-data 4.0.6, ip-address
+  10.7.0, js-yaml, brace-expansion, browserslist, postcss-selector-parser).
+  Two accepted risk chains remain, both recorded in `SECURITY.md`:
+  the `music-metadata → file-type` chain (unchanged) and the new
+  `express → qs` chain (no fix within express 4.x; local 127.0.0.1 only).
 
 ### CI
 

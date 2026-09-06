@@ -48,3 +48,32 @@ own media proxy rejects private/loopback destinations and never forwards user
 cookies to arbitrary hosts. We monitor upstream for a safe update and will
 upgrade or replace the runtime when one is available. Tracked in
 `docs/CHANGELOG.md` alongside version history.
+
+### Express / qs chain has no fix within express 4.x (since v0.4.0)
+
+The same bundled runtime pins `express@4.22.2` (latest 4.x) and `body-parser`,
+which resolve `qs@6.15.x` — below the `qs@6.16.0` fix for
+[GHSA-x5fp-wj9c-mxmx](https://github.com/advisories/GHSA-x5fp-wj9c-mxmx) and
+[GHSA-4mjr-xmp4-gh2g](https://github.com/advisories/GHSA-4mjr-xmp4-gh2g)
+(moderate, denial-of-service via crafted query strings). No express 4.x release
+raises the `qs` range, so the only real fixes are an express 5 migration or a
+NetEase API runtime replacement.
+
+**Status: Known Risk (accepted).** The service binds to `127.0.0.1` only and
+parses query strings from the local app and from NetEase's own responses; it is
+not reachable from the network. Tracked in `docs/CHANGELOG.md`.
+
+### Resolved by compatible updates (2026-09-06)
+
+`npm audit fix` (non-force, within declared semver ranges) plus a `vite`
+6.4.3 upgrade cleared 9 of the 15 previously reported advisories in the root
+tree and 9 of 15 in the bundled runtime tree:
+
+- vite 6.4.3 — 3 high dev-server advisories (optimized-deps `.map` path
+  traversal, launch-editor NTLMv2 disclosure, `server.fs.deny` Windows bypass)
+  plus the esbuild dev-server advisory via the bundled esbuild 0.25.12.
+- axios 1.18.1 (prototype-pollution / auth-injection family), form-data 4.0.6
+  (CRLF injection), ip-address 10.7.0 (SSRF misclassification family),
+  js-yaml 4.3.1, brace-expansion, browserslist, postcss-selector-parser.
+
+The remaining six reports are exactly the two accepted risk chains above.
