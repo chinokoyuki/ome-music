@@ -24,15 +24,14 @@ use walkdir::WalkDir;
 pub mod qqmusic;
 use qqmusic::{
     bootstrap_qqmusic_session, classify_qqmusic_auth_failure, delete_qqmusic_token,
-    extract_cookie_raw, extract_qqmusic_signing_key, fetch_qqmusic_liked_songs,
-    fetch_qqmusic_lyrics, fetch_qqmusic_playable_url, fetch_qqmusic_playlist,
-    fetch_qqmusic_song_metadata, fetch_qqmusic_user_playlists, fetch_qqmusic_user_profile,
-    fetch_qqmusic_vip_status, is_trusted_qqmusic_media_url, is_trusted_qqmusic_webview_url,
-    load_qqmusic_source_config, proxy_qqmusic_playback, proxy_qqmusic_search_covers,
-    proxy_qqmusic_track_covers, qqmusic_credential_is_complete, read_qqmusic_token,
-    resolve_qqmusic_source_config, save_qqmusic_source_config_to_db, save_qqmusic_token,
-    search_qqmusic, test_qqmusic_connection, validate_qqmusic_base_url, QQMusicAuthState,
-    QQMUSIC_DEFAULT_BASE_URL, QQMUSIC_UA,
+    extract_qqmusic_signing_key, fetch_qqmusic_liked_songs, fetch_qqmusic_lyrics,
+    fetch_qqmusic_playable_url, fetch_qqmusic_playlist, fetch_qqmusic_song_metadata,
+    fetch_qqmusic_user_playlists, fetch_qqmusic_user_profile, fetch_qqmusic_vip_status,
+    is_trusted_qqmusic_media_url, is_trusted_qqmusic_webview_url, load_qqmusic_source_config,
+    proxy_qqmusic_playback, proxy_qqmusic_search_covers, proxy_qqmusic_track_covers,
+    qqmusic_credential_is_complete, read_qqmusic_token, resolve_qqmusic_source_config,
+    save_qqmusic_source_config_to_db, save_qqmusic_token, search_qqmusic, test_qqmusic_connection,
+    validate_qqmusic_base_url, QQMusicAuthState, QQMUSIC_DEFAULT_BASE_URL, QQMUSIC_UA,
 };
 
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a"];
@@ -70,7 +69,11 @@ struct QQMusicLoginFlow {
     message: Option<String>,
     cookie_count: usize,
     uin_present: bool,
+    /// 仅指音乐侧签名键（qm_keyst / qqmusic_key）。p_skey / superkey 属于
+    /// QQ 账号侧 Cookie，不代表 QQ 音乐会话，因此不计入该指标。
     signing_key_present: bool,
+    /// 已收集到的 Cookie 名称（仅名称，绝无值）——登录链诊断专用。
+    cookie_names: Vec<String>,
     verified: bool,
 }
 
@@ -82,28 +85,30 @@ impl Default for QQMusicLoginFlow {
             cookie_count: 0,
             uin_present: false,
             signing_key_present: false,
+            cookie_names: Vec::new(),
             verified: false,
         }
     }
 }
 
 impl QQMusicLoginFlow {
-    /// 仅提取脱敏指标（条数 / 布尔）；绝不含任何凭据值。
+    /// 仅提取脱敏指标（条数 / 名称 / 布尔）；绝不含任何凭据值。
     /// 目前仅 Windows 的 CookieManager 收集路径调用它；非 Windows 编译时
     /// 该函数保持闲置，避免 cfg 差异触发 dead_code。
     #[cfg_attr(not(windows), allow(dead_code))]
     fn metrics_from_cookie(cookie: &str) -> Self {
-        let count = cookie.split(';').filter(|p| !p.trim().is_empty()).count();
+        let entries = qqmusic::parse_cookie_header(cookie);
+        let count = entries.len();
+        let cookie_names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
         let uin_present = ["uin", "p_uin", "wxuin", "superuin", "euin"]
             .iter()
             .any(|name| qqmusic::extract_cookie_raw(cookie, name).is_some());
-        let signing_key_present = qqmusic::extract_qqmusic_signing_key(cookie).is_some()
-            || qqmusic::extract_cookie_raw(cookie, "p_skey").is_some()
-            || qqmusic::extract_cookie_raw(cookie, "superkey").is_some();
+        let signing_key_present = qqmusic::extract_qqmusic_signing_key(cookie).is_some();
         Self {
             cookie_count: count,
             uin_present,
             signing_key_present,
+            cookie_names,
             ..Self::default()
         }
     }
@@ -2484,13 +2489,11 @@ async fn finalize_qqmusic_cookie_credentials(
                 .to_string(),
         );
     }
-    // QQ 账号身份 Cookie 未必等于 QQ 音乐会话：缺音乐侧签名 Cookie 时先引导。
-    let candidate = if extract_qqmusic_signing_key(cookie).is_none()
-        && extract_cookie_raw(cookie, "p_skey").is_none()
-        && extract_cookie_raw(cookie, "superkey").is_none()
-        && extract_cookie_raw(cookie, "psrf_qqaccess_token").is_none()
-    {
-        eprintln!("[QQMusic] finalize[{source}]: signing key missing, bootstrapping via y.qq.com");
+    // QQ 账号身份 Cookie 未必等于 QQ 音乐会话：verify 只认音乐侧签名键
+    // （qm_keyst / qqmusic_key）。p_skey / superkey 属于账号侧，不能因它们
+    // 存在就跳过引导——这正是"有会话却无法播放"的根因。
+    let candidate = if extract_qqmusic_signing_key(cookie).is_none() {
+        eprintln!("[QQMusic] finalize[{source}]: music signing key missing, bootstrapping QQ account session into a QQ Music session");
         bootstrap_qqmusic_session(cookie).await.unwrap_or_else(|e| {
             eprintln!("[QQMusic] finalize[{source}]: bootstrap unavailable: {e}");
             cookie.to_string()

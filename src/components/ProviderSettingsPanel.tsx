@@ -1031,6 +1031,9 @@ export function ProviderSettingsPanel({
           }
         } else if (flow.status === "canceled") {
           if (!cancelled) setQQMusicWebLoginMode(null);
+        } else if (flow.status === "failed") {
+          // Surface the backend's real reason (never a value — masked only).
+          if (!cancelled && flow.message) setQQMusicMsg(flow.message);
         }
       } catch {
         /* transient backend error: keep polling, never fake a state */
@@ -2725,7 +2728,7 @@ export function ProviderSettingsPanel({
                                               : qqmusicLoginFlow.status === "canceled"
                                                 ? "登录窗口已关闭 / Sign-in window closed"
                                                 : "正在打开官方窗口… / Opening the official window…"
-                                    } · cookies=${qqmusicLoginFlow.cookieCount} · uin=${qqmusicLoginFlow.uinPresent} · key=${qqmusicLoginFlow.signingKeyPresent}`
+                                    } · cookies=${qqmusicLoginFlow.cookieCount} · uin=${qqmusicLoginFlow.uinPresent} · musicKey=${qqmusicLoginFlow.signingKeyPresent}${qqmusicLoginFlow.message ? ` · ${qqmusicLoginFlow.message}` : ""}`
                                   : "正在打开官方窗口… / Opening the official window…"}
                               </div>
                               <div className="grid gap-3 sm:grid-cols-2">

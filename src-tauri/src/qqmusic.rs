@@ -1988,44 +1988,149 @@ pub async fn fetch_qqmusic_lyrics(
 
 /// QQ 账号会话 → QQ 音乐会话引导（bootstrap）。
 ///
-/// 某些登录链（QQ 账号侧扫码 redirect、手动 Cookie 导入）只携带 QQ 账号身份
-/// Cookie（uin/skey/p_skey 等），缺少音乐侧签名 Cookie（qm_keyst / qqmusic_key）。
-/// 该引导以既有 Cookie 访问一次固定可信的 QQ 音乐官方首页（y.qq.com），
-/// 尽力让官方端点为该身份发放音乐侧 Cookie，并把 Set-Cookie 合并回集合。
+/// 官方 WebView / Cookie 导入常只携带 QQ 账号身份 Cookie（uin/skey/p_skey），
+/// 缺少音乐侧签名 Cookie（qm_keyst / qqmusic_key）。两者不可混谈：
+/// verify_qqmusic_session 只认音乐侧凭据。本引导复刻官方登录链的两步交换：
+///
+///   1) 以既有 Cookie 访问 y.qq.com（最多 3 跳，手动跟随重定向），
+///      合并沿途 Set-Cookie；
+///   2) 仍无音乐侧签名 Cookie 时，调用官方
+///      fcg_music_oauth_get_accesstoken.fcg（与 QR 登录链相同端点），
+///      以 QQ Connect Cookie 换取 qqmusic_key / musickey ——
+///      优先取响应 Set-Cookie，其次解析 JSON 字段。
 ///
 /// 约束：
-/// - 目标 URL 是编译期常量，不接受任何用户输入（非任意 URL 请求器）；
-/// - 只合并 Cookie 名称（空值删除语义沿用 merge_set_cookie_header）；
-/// - 引导结果是否"已登录"仍只能由 verify_qqmusic_session 裁决；
-/// - 日志只允许状态码 / 计数 / 长度，绝无 Cookie 值。
+/// - 所有目标 URL 都是编译期常量或同一可信主机（u.y.qq.com / y.qq.com）
+///   内的跳转，经 parse_trusted_qqmusic_login_url 校验，绝非任意 URL 请求器；
+/// - 只合并 Cookie 名称；日志只输出状态码 / 计数 / Cookie 名称（绝无值）；
+/// - 引导结果是否"已登录"仍只能由 verify_qqmusic_session 裁决。
 pub async fn bootstrap_qqmusic_session(cookie: &str) -> Result<String, String> {
-    const BOOTSTRAP_URL: &str = "https://y.qq.com/";
+    const YQQ_HOME: &str = "https://y.qq.com/";
+    const OAUTH_URLS: [&str; 2] = [
+        "https://u.y.qq.com/cgi-bin/fcg_music_oauth_get_accesstoken.fcg?client_id=100497308&format=json&inCharset=utf8&outCharset=utf-8",
+        "https://u.y.qq.com/cgi-bin/fcg_music_oauth_get_accesstoken.fcg?client_id=100497308&grant_type=authorization_code&format=json",
+    ];
+    let has_music_key = |header: &str| extract_qqmusic_signing_key(header).is_some();
+
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(BOOTSTRAP_URL)
-        .header("Cookie", cookie)
-        .header("User-Agent", QQMUSIC_UA)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let set_cookies: Vec<String> = resp
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok().map(ToString::to_string))
-        .collect();
-    let merged = merge_set_cookie_header(cookie, &set_cookies);
-    eprintln!(
-        "[QQMusic] bootstrap: status={}, set_cookie_count={}, merged_cookie_count={}",
-        status,
-        set_cookies.len(),
-        merged.split(';').filter(|p| !p.trim().is_empty()).count()
-    );
+
+    // Step 1: y.qq.com 首页及重定向跳（最多 3 跳）。
+    let mut current = parse_trusted_qqmusic_login_url(YQQ_HOME)?;
+    for hop in 0..3u32 {
+        let resp = client
+            .get(current.clone())
+            .header("Cookie", cookie)
+            .header("User-Agent", QQMUSIC_UA)
+            .header("Referer", YQQ_HOME)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let set_cookies: Vec<String> = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(ToString::to_string))
+            .collect();
+        let merged = merge_set_cookie_header(cookie, &set_cookies);
+        eprintln!(
+            "[QQMusic] bootstrap: y.qq.com hop={hop}, status={status}, set_cookie_count={}, cookie_names=[{}]",
+            set_cookies.len(),
+            cookie_name_list(&merged)
+        );
+        if status.is_redirection() {
+            let loc = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            if loc.is_empty() {
+                break;
+            }
+            let resolved = current.join(&loc).map_err(|e| e.to_string())?;
+            current = parse_trusted_qqmusic_login_url(resolved.as_str())?;
+            continue;
+        }
+        break;
+    }
+
+    // Step 2: 官方 OAuth 交换（QQ Connect Cookie → qqmusic_key / musickey）。
+    if has_music_key(cookie) {
+        eprintln!("[QQMusic] bootstrap: music signing key already present, oauth exchange skipped");
+        return Ok(cookie.to_string());
+    }
+    let mut merged = cookie.to_string();
+    for oauth_url in OAUTH_URLS {
+        let resp = client
+            .get(oauth_url)
+            .header("Cookie", merged.as_str())
+            .header("User-Agent", QQMUSIC_UA)
+            .header("Referer", YQQ_HOME)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+        let Ok(resp) = resp else {
+            continue;
+        };
+        let status = resp.status();
+        let set_cookies: Vec<String> = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(ToString::to_string))
+            .collect();
+        let body = resp.text().await.unwrap_or_default();
+        merged = merge_set_cookie_header(&merged, &set_cookies);
+
+        // 响应头没有直接给 Cookie 时，从 JSON 里取 musickey / access_token。
+        if !has_music_key(&merged) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                let fields = ["musickey", "qqmusic_key", "access_token", "key", "token"];
+                let root = fields.iter().find_map(|field| {
+                    json.get(*field)
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                });
+                let nested = json.get("data").and_then(|data| {
+                    fields.iter().find_map(|field| {
+                        data.get(*field)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                    })
+                });
+                if let Some(value) = root.or(nested) {
+                    merged = merge_set_cookie_header(
+                        &merged,
+                        &[format!("qqmusic_key={value}; Path=/; Domain=.qq.com")],
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[QQMusic] bootstrap: oauth exchange done, status={status}, set_cookie_count={}, music_key_present={}, cookie_names=[{}]",
+            status,
+            has_music_key(&merged),
+            cookie_name_list(&merged)
+        );
+        if has_music_key(&merged) {
+            break;
+        }
+    }
     Ok(merged)
+}
+
+/// 诊断辅助：仅列出 Cookie 名称（绝不含值）。
+fn cookie_name_list(cookie_header: &str) -> String {
+    parse_cookie_header(cookie_header)
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn read_qqmusic_token() -> Option<String> {

@@ -84,6 +84,8 @@ export interface QQMusicLoginFlow {
   cookieCount: number;
   uinPresent: boolean;
   signingKeyPresent: boolean;
+  /** Collected cookie NAMES only (never values) — login-chain diagnostics. */
+  cookieNames: string[];
   verified: boolean;
 }
 
@@ -977,6 +979,7 @@ export class QQMusicAccountSessionProvider {
         cookieCount: 0,
         uinPresent: false,
         signingKeyPresent: false,
+        cookieNames: [],
         verified: false,
       };
     }
