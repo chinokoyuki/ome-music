@@ -1722,7 +1722,9 @@ async fn get_qqmusic_login_status(
 
 #[tauri::command]
 async fn logout_qqmusic(
-    app: tauri::AppHandle,
+    // Named `_app` because the only use is the Windows-only WebView2 cookie
+    // cleanup below; on other platforms the parameter is intentionally idle.
+    _app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<qqmusic::QQMusicLoginStatusDto, String> {
     delete_qqmusic_token()?;
@@ -1739,7 +1741,7 @@ async fn logout_qqmusic(
     // import, in which case the profile cookies remain on disk but are not
     // readable by Ome Music without the window — a documented residual.
     #[cfg(windows)]
-    if let Some(window) = app.get_webview_window("qqmusic-login") {
+    if let Some(window) = _app.get_webview_window("qqmusic-login") {
         let _ = window
             .with_webview(|webview| unsafe {
                 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_2;

@@ -3137,8 +3137,8 @@ async fn follow_qqmusic_login_redirect(
         let cookie_str = accumulated.join("; ");
         // 尝试多种参数组合
         let oauth_urls = vec![
-            format!("https://u.y.qq.com/cgi-bin/fcg_music_oauth_get_accesstoken.fcg?client_id=100497308&format=json&inCharset=utf8&outCharset=utf-8"),
-            format!("https://u.y.qq.com/cgi-bin/fcg_music_oauth_get_accesstoken.fcg?client_id=100497308&grant_type=authorization_code&format=json"),
+            "https://u.y.qq.com/cgi-bin/fcg_music_oauth_get_accesstoken.fcg?client_id=100497308&format=json&inCharset=utf8&outCharset=utf-8".to_string(),
+            "https://u.y.qq.com/cgi-bin/fcg_music_oauth_get_accesstoken.fcg?client_id=100497308&grant_type=authorization_code&format=json".to_string(),
         ];
         for oauth_url in &oauth_urls {
             let oauth_resp = client
