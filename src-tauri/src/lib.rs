@@ -9757,18 +9757,32 @@ mod tests {
     fn music_scope_normalization_rejects_parent_traversal() {
         use std::path::Path;
 
-        // `..` components must be rejected outright.
-        assert!(super::normalize_music_scope_path(r"D:\Music\..\Secret").is_err());
-        assert!(super::normalize_music_scope_path("/home/user/Music/../.ssh").is_err());
-        // Empty paths are rejected.
+        // Empty paths are rejected (platform-neutral).
         assert!(super::normalize_music_scope_path("").is_err());
         assert!(super::normalize_music_scope_path("   ").is_err());
-        // Legitimate nested paths pass through cleanly (trailing/leading
-        // whitespace trimmed; redundant `.` components dropped).
-        let nested = super::normalize_music_scope_path(r"D:\Music\子目录\Album").unwrap();
-        assert!(nested.starts_with(Path::new(r"D:\Music")));
-        let dot_cleaned = super::normalize_music_scope_path(r"D:\Music\.\Album").unwrap();
-        assert_eq!(dot_cleaned, Path::new(r"D:\Music\Album"));
+        // Path::components() parses platform-native separators only, so each
+        // platform asserts against its own path semantics.
+        #[cfg(windows)]
+        {
+            // `..` components must be rejected outright.
+            assert!(super::normalize_music_scope_path(r"D:\Music\..\Secret").is_err());
+            // Legitimate nested paths pass through cleanly (trailing/leading
+            // whitespace trimmed; redundant `.` components dropped).
+            let nested = super::normalize_music_scope_path(r"D:\Music\子目录\Album").unwrap();
+            assert!(nested.starts_with(Path::new(r"D:\Music")));
+            let dot_cleaned = super::normalize_music_scope_path(r"D:\Music\.\Album").unwrap();
+            assert_eq!(dot_cleaned, Path::new(r"D:\Music\Album"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(super::normalize_music_scope_path("/home/user/Music/../.ssh").is_err());
+            let nested =
+                super::normalize_music_scope_path("/home/user/Music/子目录/Album").unwrap();
+            assert!(nested.starts_with(Path::new("/home/user/Music")));
+            let dot_cleaned =
+                super::normalize_music_scope_path("/home/user/Music/./Album").unwrap();
+            assert_eq!(dot_cleaned, Path::new("/home/user/Music/Album"));
+        }
     }
 }
 
