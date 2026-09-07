@@ -27,6 +27,16 @@ This project follows small, traceable releases. Keep entries short and focused o
 
 ### Changed
 
+- **QQ Music sign-in rebuilt around the official WebView (P0 fix)**: the
+  app-owned official sign-in window is now the primary login — after the user
+  confirms on their phone, a backend watcher collects the session via the
+  native WebView2 CookieManager, bootstraps a QQ Music session from QQ account
+  cookies when needed, verifies it against the QQ Music API, stores it in the
+  OS keyring and closes the window automatically (no manual "Extract/Check"
+  steps). A verification failure now saves nothing and reports the real
+  reason; the direct ptlogin QR is demoted to an experimental Advanced entry
+  (QQ servers 403 it on many real networks) with an "Use Official Sign-in"
+  escape hatch, and Cookie import moved into the same Advanced block.
 - NetEase service startup is single-flight (async lock + re-check), health
   checks verify the API response shape instead of any HTTP 200, and the
   bundled runtime becomes optional per user configuration.
