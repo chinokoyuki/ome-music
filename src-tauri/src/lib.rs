@@ -89,6 +89,9 @@ impl Default for QQMusicLoginFlow {
 
 impl QQMusicLoginFlow {
     /// 仅提取脱敏指标（条数 / 布尔）；绝不含任何凭据值。
+    /// 目前仅 Windows 的 CookieManager 收集路径调用它；非 Windows 编译时
+    /// 该函数保持闲置，避免 cfg 差异触发 dead_code。
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn metrics_from_cookie(cookie: &str) -> Self {
         let count = cookie.split(';').filter(|p| !p.trim().is_empty()).count();
         let uin_present = ["uin", "p_uin", "wxuin", "superuin", "euin"]
