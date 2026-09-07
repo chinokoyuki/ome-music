@@ -23,7 +23,8 @@ use walkdir::WalkDir;
 
 pub mod qqmusic;
 use qqmusic::{
-    classify_qqmusic_auth_failure, delete_qqmusic_token, fetch_qqmusic_liked_songs,
+    bootstrap_qqmusic_session, classify_qqmusic_auth_failure, delete_qqmusic_token,
+    extract_cookie_raw, extract_qqmusic_signing_key, fetch_qqmusic_liked_songs,
     fetch_qqmusic_lyrics, fetch_qqmusic_playable_url, fetch_qqmusic_playlist,
     fetch_qqmusic_song_metadata, fetch_qqmusic_user_playlists, fetch_qqmusic_user_profile,
     fetch_qqmusic_vip_status, is_trusted_qqmusic_media_url, is_trusted_qqmusic_webview_url,
@@ -51,9 +52,66 @@ pub struct AppState {
     db: Mutex<Connection>,
     media_proxy: Mutex<HashMap<String, MediaProxyEntry>>,
     qqmusic_qr_sessions: Mutex<HashMap<String, String>>,
+    qqmusic_login_flow: Mutex<QQMusicLoginFlow>,
     managed_netease_api: Option<ManagedNeteaseApiRuntime>,
     pub managed_netease_child: Arc<Mutex<Option<Child>>>,
     managed_netease_start_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// QQ 官方 WebView 登录流程的对外只读状态。
+/// 后端是登录状态的唯一权威（状态机：idle → waiting_for_user → collecting →
+/// verifying → authenticated / failed / canceled）；前端只允许读取与展示，
+/// 绝不允许凭"用户大概登录完了"自行断言 authenticated。
+/// 仅携带脱敏元数据（计数 / 布尔 / 文案），任何凭据值都不得进入该结构。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QQMusicLoginFlow {
+    status: &'static str,
+    message: Option<String>,
+    cookie_count: usize,
+    uin_present: bool,
+    signing_key_present: bool,
+    verified: bool,
+}
+
+impl Default for QQMusicLoginFlow {
+    fn default() -> Self {
+        Self {
+            status: "idle",
+            message: None,
+            cookie_count: 0,
+            uin_present: false,
+            signing_key_present: false,
+            verified: false,
+        }
+    }
+}
+
+impl QQMusicLoginFlow {
+    /// 仅提取脱敏指标（条数 / 布尔）；绝不含任何凭据值。
+    fn metrics_from_cookie(cookie: &str) -> Self {
+        let count = cookie.split(';').filter(|p| !p.trim().is_empty()).count();
+        let uin_present = ["uin", "p_uin", "wxuin", "superuin", "euin"]
+            .iter()
+            .any(|name| qqmusic::extract_cookie_raw(cookie, name).is_some());
+        let signing_key_present = qqmusic::extract_qqmusic_signing_key(cookie).is_some()
+            || qqmusic::extract_cookie_raw(cookie, "p_skey").is_some()
+            || qqmusic::extract_cookie_raw(cookie, "superkey").is_some();
+        Self {
+            cookie_count: count,
+            uin_present,
+            signing_key_present,
+            ..Self::default()
+        }
+    }
+
+    fn with_status(status: &'static str, message: Option<String>) -> Self {
+        Self {
+            status,
+            message,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1487,51 +1545,9 @@ async fn import_qqmusic_token(
     if cookie.is_empty() {
         return Err("QQ音乐 Cookie 为空 / QQ Music cookie is empty.".to_string());
     }
-    if !qqmusic_credential_is_complete(cookie) {
-        return Err(
-            "登录凭据不完整，本次导入未保存 / The session is incomplete and was not saved."
-                .to_string(),
-        );
-    }
     // Verify first. An incomplete, expired, or untrusted session must never
     // replace a previously working credential in Windows Credential Manager.
-    let config = qqmusic::ResolvedQQMusicSourceConfig {
-        enabled: true,
-        base_url: QQMUSIC_DEFAULT_BASE_URL.to_string(),
-        token: Some(cookie.to_string()),
-    };
-    match qqmusic::verify_qqmusic_session(&config).await {
-        Ok((uin, nickname)) => persist_qqmusic_login_status(
-            cookie,
-            qqmusic::QQMusicLoginStatusDto {
-                logged_in: true,
-                credential_present: true,
-                status: QQMusicAuthState::Authenticated,
-                uin,
-                nickname,
-                avatar_url: String::new(),
-                vip_type: "none".to_string(),
-                message: "QQ音乐已连接 / QQ Music connected.".to_string(),
-            },
-        ),
-        Err(e) => {
-            let status = classify_qqmusic_auth_failure(&e, true, true);
-            let message = if status == QQMusicAuthState::Expired {
-                "登录凭据已过期，未保存本次导入 / The session expired and was not saved."
-            } else {
-                "无法验证登录凭据，本次导入未保存 / The session could not be verified and was not saved."
-            };
-            Err(message.to_string())
-        }
-    }
-}
-
-fn persist_qqmusic_login_status(
-    cookie: &str,
-    status: qqmusic::QQMusicLoginStatusDto,
-) -> Result<qqmusic::QQMusicLoginStatusDto, String> {
-    save_qqmusic_token(cookie)?;
-    Ok(status)
+    finalize_qqmusic_cookie_credentials(cookie, "import").await
 }
 
 #[derive(Debug, Serialize)]
@@ -2452,9 +2468,94 @@ struct QQMusicWebviewLoginPayload {
 
 /// Open the official QQ Music page in an isolated WebView. The page owns the
 /// QQ/WeChat sign-in UI; Ome Music never injects credential-reading scripts.
+/// 统一的 QQ 音乐认证收口（Cookie 集合 → 引导 → 验证 → keyring）。
+/// QR / WebView / Cookie Import 三条链最终都走这里；authenticated 只能由
+/// verify_qqmusic_session 真实成功产生，验证失败绝不落盘。
+async fn finalize_qqmusic_cookie_credentials(
+    cookie: &str,
+    source: &'static str,
+) -> Result<qqmusic::QQMusicLoginStatusDto, String> {
+    if !qqmusic_credential_is_complete(cookie) {
+        return Err(
+            "登录凭据不完整（缺少账号身份或签名 Cookie），未保存 / The session is incomplete and was not saved."
+                .to_string(),
+        );
+    }
+    // QQ 账号身份 Cookie 未必等于 QQ 音乐会话：缺音乐侧签名 Cookie 时先引导。
+    let candidate = if extract_qqmusic_signing_key(cookie).is_none()
+        && extract_cookie_raw(cookie, "p_skey").is_none()
+        && extract_cookie_raw(cookie, "superkey").is_none()
+        && extract_cookie_raw(cookie, "psrf_qqaccess_token").is_none()
+    {
+        eprintln!("[QQMusic] finalize[{source}]: signing key missing, bootstrapping via y.qq.com");
+        bootstrap_qqmusic_session(cookie).await.unwrap_or_else(|e| {
+            eprintln!("[QQMusic] finalize[{source}]: bootstrap unavailable: {e}");
+            cookie.to_string()
+        })
+    } else {
+        cookie.to_string()
+    };
+    if !qqmusic_credential_is_complete(&candidate) {
+        return Err(
+            "引导后凭据仍不完整，未保存 / The session stayed incomplete after bootstrap and was not saved."
+                .to_string(),
+        );
+    }
+    let config = qqmusic::ResolvedQQMusicSourceConfig {
+        enabled: true,
+        base_url: QQMUSIC_DEFAULT_BASE_URL.to_string(),
+        token: Some(candidate.clone()),
+    };
+    match qqmusic::verify_qqmusic_session(&config).await {
+        Ok((uin, nickname)) => {
+            save_qqmusic_token(&candidate)?;
+            eprintln!(
+                "[QQMusic] finalize[{source}]: authenticated (uin_present=true, signing_key_present=true, verify=success)"
+            );
+            Ok(qqmusic::QQMusicLoginStatusDto {
+                logged_in: true,
+                credential_present: true,
+                status: QQMusicAuthState::Authenticated,
+                uin,
+                nickname,
+                avatar_url: String::new(),
+                vip_type: "none".to_string(),
+                message: "QQ音乐已连接 / QQ Music connected.".to_string(),
+            })
+        }
+        Err(e) => {
+            let status = classify_qqmusic_auth_failure(&e, true, true);
+            let reason = if status == QQMusicAuthState::Expired {
+                "官方登录会话已过期，未保存 / The official session has expired and was not saved."
+            } else {
+                "QQ 音乐服务端未能确认该会话（verify 失败），未保存 / QQ Music could not verify this session; nothing was saved."
+            };
+            eprintln!("[QQMusic] finalize[{source}]: verify failed, nothing saved");
+            Err(format!("{reason}（{e}）"))
+        }
+    }
+}
+
+/// 设置登录流程状态（保留最近一次指标）。
+fn set_qqmusic_login_flow(state: &AppState, flow: QQMusicLoginFlow) {
+    if let Ok(mut slot) = state.qqmusic_login_flow.lock() {
+        *slot = flow;
+    }
+}
+
+#[tauri::command]
+fn get_qqmusic_login_flow(state: State<'_, AppState>) -> Result<QQMusicLoginFlow, String> {
+    state
+        .qqmusic_login_flow
+        .lock()
+        .map(|flow| flow.clone())
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn open_qqmusic_webview_login(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     payload: QQMusicWebviewLoginPayload,
 ) -> Result<(), String> {
     use tauri::WebviewWindowBuilder;
@@ -2469,7 +2570,7 @@ async fn open_qqmusic_webview_login(
         "QQ音乐登录 - 请在官方页面完成登录"
     };
 
-    // 如果窗口已存在，聚焦它
+    // 如果窗口已存在，聚焦它；watcher 若仍在运行则不重复启动。
     if let Some(window) = app.get_webview_window("qqmusic-login") {
         let _ = window.set_title(title);
         window
@@ -2488,14 +2589,148 @@ async fn open_qqmusic_webview_login(
     .build()
     .map_err(|e| format!("Failed to create window: {}", e))?;
 
+    set_qqmusic_login_flow(
+        &state,
+        QQMusicLoginFlow::with_status(
+            "waiting_for_user",
+            Some(
+                "官方窗口已打开，请扫码登录 / The official window is open; scan to sign in."
+                    .to_string(),
+            ),
+        ),
+    );
+
+    // 登录完成检测由后端 watcher 负责：官方页面登录成功后自动
+    // collecting → verifying → authenticated → 关窗；前端只轮询展示状态。
+    let watch_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        watch_qqmusic_webview_login(watch_app).await;
+    });
+
     Ok(())
 }
 
-/// Validate and persist the official WebView session without exposing the
-/// credential to JavaScript, the window title, a localhost URL, or React state.
+/// 官方 WebView 登录自动收口 watcher。
+/// 周期收集隔离 profile 的 Cookie（原生 CookieManager），凭据齐备即验证；
+/// authenticated 才落盘并自动关窗。验证失败保留窗口等待用户重试，
+/// 绝不把失败伪装成成功，也绝不把会话存成 credential_present。
+#[cfg(windows)]
+async fn watch_qqmusic_webview_login(app: tauri::AppHandle) {
+    use std::time::{Duration, Instant};
+
+    const TICK: Duration = Duration::from_millis(2500);
+    const VERIFY_RETRY: Duration = Duration::from_secs(15);
+    const MAX_WAIT: Duration = Duration::from_secs(300);
+
+    let started = Instant::now();
+    let mut last_fingerprint: u64 = 0;
+    let mut last_verify = Instant::now() - VERIFY_RETRY;
+
+    loop {
+        tokio::time::sleep(TICK).await;
+        let state = app.state::<AppState>();
+        if started.elapsed() > MAX_WAIT {
+            set_qqmusic_login_flow(
+                &state,
+                QQMusicLoginFlow::with_status(
+                    "failed",
+                    Some("登录等待超时：官方窗口仍打开，可继续登录后点击“完成连接”，或关闭窗口 / Timed out waiting; the window stays open — finish signing in and use Complete Connection, or close it.".to_string()),
+                ),
+            );
+            return;
+        }
+        let Some(_window) = app.get_webview_window("qqmusic-login") else {
+            let state = app.state::<AppState>();
+            let mut flow = state
+                .qqmusic_login_flow
+                .lock()
+                .map(|f| f.clone())
+                .unwrap_or_default();
+            if flow.status != "authenticated" {
+                flow.status = "canceled";
+                flow.message = Some("登录窗口已关闭 / Sign-in window closed.".to_string());
+                set_qqmusic_login_flow(&state, flow);
+            }
+            return;
+        };
+
+        let cookie = match get_webview2_all_cookies(&app).await {
+            Ok(cookie) => cookie,
+            Err(_) => continue, // 窗口正在关闭等瞬态；下一轮判定窗口不存在
+        };
+        let mut flow = QQMusicLoginFlow::metrics_from_cookie(&cookie);
+        let complete = qqmusic_credential_is_complete(&cookie);
+
+        if !complete {
+            flow.status = "waiting_for_user";
+            flow.message =
+                Some("等待扫码确认… / Waiting for the scan to be confirmed…".to_string());
+            set_qqmusic_login_flow(&state, flow);
+            continue;
+        }
+
+        // 凭据齐备：指纹变化或到达重试间隔才再次验证，避免打爆官方接口。
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&cookie, &mut hasher);
+        let fingerprint = std::hash::Hasher::finish(&hasher);
+        let due = fingerprint != last_fingerprint || last_verify.elapsed() >= VERIFY_RETRY;
+        if !due {
+            flow.status = "verifying";
+            flow.message = Some(
+                "已收集到会话，等待验证窗口重试 / Session collected; verification retry pending."
+                    .to_string(),
+            );
+            set_qqmusic_login_flow(&state, flow);
+            continue;
+        }
+
+        flow.status = "verifying";
+        flow.message = Some("正在确认 QQ 音乐账号… / Confirming the QQ Music account…".to_string());
+        set_qqmusic_login_flow(&state, flow);
+        last_fingerprint = fingerprint;
+        last_verify = Instant::now();
+
+        match finalize_qqmusic_cookie_credentials(&cookie, "webview").await {
+            Ok(status) => {
+                let mut flow = QQMusicLoginFlow::metrics_from_cookie(&cookie);
+                flow.status = "authenticated";
+                flow.verified = true;
+                flow.message = Some(status.message.clone());
+                set_qqmusic_login_flow(&state, flow);
+                if let Some(window) = app.get_webview_window("qqmusic-login") {
+                    let _ = window.close();
+                }
+                return;
+            }
+            Err(e) => {
+                let mut flow = QQMusicLoginFlow::metrics_from_cookie(&cookie);
+                flow.status = "failed";
+                flow.message = Some(e.clone());
+                set_qqmusic_login_flow(&state, flow);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+async fn watch_qqmusic_webview_login(app: tauri::AppHandle) {
+    // CookieManager 收集仅在 Windows 可用；其他平台保持手动 Cookie 导入路径。
+    let state = app.state::<AppState>();
+    set_qqmusic_login_flow(
+        &state,
+        QQMusicLoginFlow::with_status(
+            "failed",
+            Some("内嵌登录窗口目前仅支持 Windows；请使用 Cookie 导入 / The embedded sign-in window is Windows-only; use Cookie Import.".to_string()),
+        ),
+    );
+}
+
+/// 手动收口入口（“完成连接”fallback 按钮）：与自动 watcher 走同一个
+/// finalize——验证成功才落盘，验证失败返回真实原因且绝不保存。
 #[tauri::command]
 async fn import_qqmusic_webview_session(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<qqmusic::QQMusicLoginStatusDto, String> {
     let window = app
         .get_webview_window("qqmusic-login")
@@ -2511,68 +2746,42 @@ async fn import_qqmusic_webview_session(
     #[cfg(windows)]
     {
         let cookie = get_webview2_all_cookies(&app).await?;
+        set_qqmusic_login_flow(&state, QQMusicLoginFlow::metrics_from_cookie(&cookie));
         if !qqmusic_credential_is_complete(&cookie) {
+            set_qqmusic_login_flow(
+                &state,
+                QQMusicLoginFlow::with_status(
+                    "waiting_for_user",
+                    Some("登录尚未完成，请在官方窗口完成扫码 / Sign-in is incomplete. Finish scanning in the official window.".to_string()),
+                ),
+            );
             return Err(
                 "登录尚未完成，请在官方窗口完成扫码 / Sign-in is incomplete. Finish scanning in the official window."
                     .to_string(),
             );
         }
-        let config = qqmusic::ResolvedQQMusicSourceConfig {
-            enabled: true,
-            base_url: QQMUSIC_DEFAULT_BASE_URL.to_string(),
-            token: Some(cookie.clone()),
-        };
-        match qqmusic::verify_qqmusic_session(&config).await {
-            Ok((uin, nickname)) => persist_qqmusic_login_status(
-                &cookie,
-                qqmusic::QQMusicLoginStatusDto {
-                    logged_in: true,
-                    credential_present: true,
-                    status: QQMusicAuthState::Authenticated,
-                    uin,
-                    nickname,
-                    avatar_url: String::new(),
-                    vip_type: "none".to_string(),
-                    message: "QQ音乐已连接 / QQ Music connected.".to_string(),
-                },
-            ),
-            Err(error) => {
-                let status = classify_qqmusic_auth_failure(&error, true, true);
-                if status == QQMusicAuthState::Expired {
-                    return Err(
-                        "官方登录会话已过期，请重新登录 / The official session has expired. Please sign in again."
-                            .to_string(),
-                    );
-                }
-
-                // This credential came from the isolated, trusted QQ Music
-                // WebView profile and passed the complete-session allowlist.
-                // Legacy user-info methods can reject valid WeChat sessions;
-                // preserve the official session and let the first real music
-                // request determine availability instead of discarding it.
-                eprintln!(
-                    "[QQMusic] trusted official WebView session saved; legacy verification unavailable"
-                );
-                persist_qqmusic_login_status(
-                    &cookie,
-                    qqmusic::QQMusicLoginStatusDto {
-                    logged_in: false,
-                    credential_present: true,
-                    status: QQMusicAuthState::CredentialPresent,
-                    uin: String::new(),
-                    nickname: String::new(),
-                    avatar_url: String::new(),
-                    vip_type: "none".to_string(),
-                    message: "官方会话已安全保存；账号权限将在播放时确认 / Official session saved; account access will be confirmed during playback."
-                        .to_string(),
-                    },
-                )
+        match finalize_qqmusic_cookie_credentials(&cookie, "webview-manual").await {
+            Ok(status) => {
+                let mut flow = QQMusicLoginFlow::metrics_from_cookie(&cookie);
+                flow.status = "authenticated";
+                flow.verified = true;
+                flow.message = Some(status.message.clone());
+                set_qqmusic_login_flow(&state, flow);
+                Ok(status)
+            }
+            Err(e) => {
+                let mut flow = QQMusicLoginFlow::metrics_from_cookie(&cookie);
+                flow.status = "failed";
+                flow.message = Some(e.clone());
+                set_qqmusic_login_flow(&state, flow);
+                Err(e)
             }
         }
     }
 
     #[cfg(not(windows))]
     {
+        let _ = state;
         Err("Embedded QQ Music session import is currently available on Windows only.".to_string())
     }
 }
@@ -9843,6 +10052,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 db: Mutex::new(db),
                 media_proxy: Mutex::new(HashMap::new()),
                 qqmusic_qr_sessions: Mutex::new(HashMap::new()),
+                qqmusic_login_flow: Mutex::new(QQMusicLoginFlow::default()),
                 managed_netease_api,
                 managed_netease_child: Arc::new(Mutex::new(None)),
                 managed_netease_start_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -9945,6 +10155,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             open_qqmusic_webview_login,
             import_qqmusic_webview_session,
             close_qqmusic_webview_login,
+            get_qqmusic_login_flow,
             search_qqmusic_songs,
             get_qqmusic_song_metadata,
             get_qqmusic_playable_url,

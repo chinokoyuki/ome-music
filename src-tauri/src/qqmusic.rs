@@ -328,7 +328,7 @@ fn qqmusic_gtk(key: &str) -> u32 {
 }
 
 /// 从 cookie 字符串中提取指定名称的 cookie 值（原始值，不做清理）
-fn extract_cookie_raw(cookie: &str, name: &str) -> Option<String> {
+pub fn extract_cookie_raw(cookie: &str, name: &str) -> Option<String> {
     let prefix = format!("{}=", name);
     for part in cookie.split(';') {
         let part = part.trim();
@@ -448,7 +448,7 @@ pub(crate) fn merge_set_cookie_header(existing: &str, set_cookies: &[String]) ->
 /// 现代 QQ 音乐 web 使用 qm_keyst 字段（非 qqmusic_key）。
 /// Modern QQ Music web uses qm_keyst (not qqmusic_key).
 /// 优先 qm_keyst，回退到 qqmusic_key 以兼容旧 cookie。
-fn extract_qqmusic_signing_key(cookie: &str) -> Option<String> {
+pub fn extract_qqmusic_signing_key(cookie: &str) -> Option<String> {
     extract_cookie_raw(cookie, "qm_keyst").or_else(|| extract_cookie_raw(cookie, "qqmusic_key"))
 }
 
@@ -1985,6 +1985,48 @@ pub async fn fetch_qqmusic_lyrics(
 }
 
 // ── Cookie / Token 管理 ──────────────────────────────────────────────
+
+/// QQ 账号会话 → QQ 音乐会话引导（bootstrap）。
+///
+/// 某些登录链（QQ 账号侧扫码 redirect、手动 Cookie 导入）只携带 QQ 账号身份
+/// Cookie（uin/skey/p_skey 等），缺少音乐侧签名 Cookie（qm_keyst / qqmusic_key）。
+/// 该引导以既有 Cookie 访问一次固定可信的 QQ 音乐官方首页（y.qq.com），
+/// 尽力让官方端点为该身份发放音乐侧 Cookie，并把 Set-Cookie 合并回集合。
+///
+/// 约束：
+/// - 目标 URL 是编译期常量，不接受任何用户输入（非任意 URL 请求器）；
+/// - 只合并 Cookie 名称（空值删除语义沿用 merge_set_cookie_header）；
+/// - 引导结果是否"已登录"仍只能由 verify_qqmusic_session 裁决；
+/// - 日志只允许状态码 / 计数 / 长度，绝无 Cookie 值。
+pub async fn bootstrap_qqmusic_session(cookie: &str) -> Result<String, String> {
+    const BOOTSTRAP_URL: &str = "https://y.qq.com/";
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(BOOTSTRAP_URL)
+        .header("Cookie", cookie)
+        .header("User-Agent", QQMUSIC_UA)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let set_cookies: Vec<String> = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(ToString::to_string))
+        .collect();
+    let merged = merge_set_cookie_header(cookie, &set_cookies);
+    eprintln!(
+        "[QQMusic] bootstrap: status={}, set_cookie_count={}, merged_cookie_count={}",
+        status,
+        set_cookies.len(),
+        merged.split(';').filter(|p| !p.trim().is_empty()).count()
+    );
+    Ok(merged)
+}
 
 pub fn read_qqmusic_token() -> Option<String> {
     keyring::Entry::new(QQMUSIC_KEYRING_SERVICE, QQMUSIC_KEYRING_ACCOUNT)
@@ -4443,6 +4485,46 @@ pub async fn fetch_qqmusic_user_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_merge_last_value_wins_and_empty_deletes_are_skipped() {
+        // Duplicate rule required by the auth P0: later values override
+        // earlier ones in place, and a server-side deletion (empty value)
+        // never wipes a valid value collected from another hop.
+        let merged = merge_cookie_entries(parse_cookie_header(
+            "qm_keyst=old; uin=1000; qm_keyst=; uin=; qm_keyst=new",
+        ));
+        assert_eq!(merged, "qm_keyst=new; uin=1000");
+    }
+
+    #[test]
+    fn cookie_merge_strips_set_cookie_attributes_and_keeps_base64_padding() {
+        // Values may contain '=' (base64 padding) and Set-Cookie attributes
+        // (Expires/Path/Domain/HttpOnly/Secure/SameSite) must never leak into
+        // the Cookie header we send.
+        let merged = merge_set_cookie_header(
+            "uin=o12345",
+            &[
+                "qm_keyst=abc==; Path=/; Domain=.qq.com; HttpOnly; Secure; SameSite=None; Expires=Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+                "p_skey=; Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+            ],
+        );
+        assert!(merged.contains("qm_keyst=abc=="));
+        assert!(merged.contains("uin=o12345"));
+        assert!(!merged.contains("Path=/"));
+        assert!(!merged.contains("HttpOnly"));
+        assert!(!merged.contains("p_skey="));
+    }
+
+    #[test]
+    fn credential_completeness_requires_identity_plus_signing_key() {
+        // QQ account identity alone (as often collected after a ptlogin
+        // redirect) is NOT a QQ Music session; completeness gates bootstrap.
+        assert!(!qqmusic_credential_is_complete("uin=o12345; skey=@abcDEF"));
+        assert!(qqmusic_credential_is_complete("uin=o12345; qm_keyst=abc=="));
+        assert!(qqmusic_credential_is_complete("uin=o12345; p_skey=toto"));
+        assert!(!qqmusic_credential_is_complete("qm_keyst=abc=="));
+    }
 
     #[test]
     fn test_sign_algorithm() {

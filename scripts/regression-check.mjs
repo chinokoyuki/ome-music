@@ -160,10 +160,59 @@ expectMatch(
   /import_qqmusic_webview_session/,
   "WebView session validation and persistence must remain atomic in Rust",
 );
+// 2026-09 P0: the official WebView login is the primary path. The backend
+// login-flow watcher is the sole auth authority and `authenticated` may only
+// be produced by a successful server verify — a verify failure must never be
+// persisted as credential_present (the old save-anyway branch is removed).
+expectNoMatch(
+  rustLib,
+  /trusted official WebView session saved/,
+  "a WebView session that fails verification must never be saved as credential_present (strict finalize only)",
+);
 expectMatch(
   rustLib,
-  /trusted official WebView session saved[\s\S]*status: QQMusicAuthState::CredentialPresent/,
-  "a complete trusted WebView session must remain explicitly credential-present when legacy verification is unavailable",
+  /fn finalize_qqmusic_cookie_credentials/,
+  "QR, WebView and Cookie-Import must all finalize through one verified-only path",
+);
+expectMatch(
+  rustLib,
+  /async fn watch_qqmusic_webview_login/,
+  "the official WebView login must auto-finalize via a backend watcher (no manual-only extraction)",
+);
+expectMatch(
+  rustLib,
+  /get_qqmusic_login_flow/,
+  "the login-flow state machine must be readable by the frontend (masked metadata only)",
+);
+expectMatch(
+  qqmusic,
+  /pub async fn bootstrap_qqmusic_session/,
+  "QQ account cookies must be bootstrapped into a QQ Music session before verification",
+);
+expectMatch(
+  settings,
+  /qqmusicAuthProvider\.getLoginFlow\(\)/,
+  "the settings panel must display the backend login-flow state instead of guessing",
+);
+expectMatch(
+  settings,
+  /data-qqmusic-login-flow/,
+  "the login-flow progress indicator must be rendered while the official window is open",
+);
+expectMatch(
+  settings,
+  /登录 QQ 音乐 \/ Official Login/,
+  "the official WebView login must be the primary QQ Music sign-in button",
+);
+expectMatch(
+  settings,
+  /Direct QR（实验性）/,
+  "the direct ptlogin QR path must be explicitly labeled experimental (403 in real networks)",
+);
+expectNoMatch(
+  settings,
+  /document\.cookie/,
+  "cookies must be collected via the native WebView2 CookieManager, never document.cookie",
 );
 expectMatch(
   rustLib,

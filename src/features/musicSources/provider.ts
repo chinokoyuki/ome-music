@@ -67,6 +67,26 @@ export interface QQMusicQrCheck {
   loginStatus?: QQMusicLoginStatus;
 }
 
+/**
+ * Backend login-flow state (masked metadata only — never credential values).
+ * The backend is the sole auth authority; the frontend only displays it.
+ */
+export interface QQMusicLoginFlow {
+  status:
+    | "idle"
+    | "waiting_for_user"
+    | "collecting"
+    | "verifying"
+    | "authenticated"
+    | "failed"
+    | "canceled";
+  message: string | null;
+  cookieCount: number;
+  uinPresent: boolean;
+  signingKeyPresent: boolean;
+  verified: boolean;
+}
+
 export interface QQMusicMembership {
   vipType: "none" | "green" | "super";
   expireDate: string;
@@ -941,6 +961,26 @@ export class QQMusicAccountSessionProvider {
   async openWebviewLogin(mode: "qq" | "wechat" = "qq"): Promise<void> {
     if (!isTauriRuntime()) return;
     return invoke<void>("open_qqmusic_webview_login", { payload: { mode } });
+  }
+
+  /**
+   * Poll the backend login-flow state machine. The backend is the sole
+   * authority: it detects the completed official sign-in, finalizes
+   * (collect → bootstrap → verify → keyring) and reports masked metadata
+   * only — never credential values.
+   */
+  async getLoginFlow(): Promise<QQMusicLoginFlow> {
+    if (!isTauriRuntime()) {
+      return {
+        status: "idle",
+        message: null,
+        cookieCount: 0,
+        uinPresent: false,
+        signingKeyPresent: false,
+        verified: false,
+      };
+    }
+    return invoke<QQMusicLoginFlow>("get_qqmusic_login_flow");
   }
 
   /** Validate and persist the WebView session entirely inside Rust. */
