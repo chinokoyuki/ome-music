@@ -63,6 +63,34 @@ NetEase API runtime replacement.
 parses query strings from the local app and from NetEase's own responses; it is
 not reachable from the network. Tracked in `docs/CHANGELOG.md`.
 
+### NetEase session cookie is mirrored to a local file (since v0.3.x)
+
+On every NetEase sign-in and cookie merge, `save_netease_token`
+(`src-tauri/src/lib.rs`) writes `PersonalConfig/netease_session.local` next to
+the app working directory **before** writing the OS keyring, and keeps the file
+even when the keyring write succeeds. The file is base64 — an encoding, not
+encryption — of the full session cookie header including `MUSIC_U`: anyone who
+can read the file holds a fully valid session.
+
+**Why it exists:** when the OS keyring service transiently fails to *read*
+(Windows Credential Manager restart, Secret Service contention), the app used
+to misclassify a signed-in user as signed out — a real-world defect. The
+mirror is the graceful-degradation path. Reads prefer the keyring (3 retries
+with backoff) and only fall back to the file. Logout (`delete_netease_token`)
+removes both the keyring entry and the file.
+
+**Status for v0.4.0: Known Risk (accepted), rated P1 hardening.** It is
+pre-existing 0.3.x behavior; changing the credential write path during the
+release freeze risks login regressions, and exploiting it requires local
+same-user file access (malware, backups, folder-sync tools capturing the file).
+
+**Plan (target v0.4.1):** keyring-primary writes (fallback file only when the
+keyring write itself fails), DPAPI encryption for the fallback at rest, and
+removal of legacy plaintext mirrors on first run after upgrade. Bilibili
+sessions are already keyring-only (`save_bilibili_token` rejects the plaintext
+fallback and cleans up legacy files); QQ Music sessions are keyring-only by
+design and never had a file mirror.
+
 ### Resolved by compatible updates (2026-09-06)
 
 `npm audit fix` (non-force, within declared semver ranges) plus a `vite`

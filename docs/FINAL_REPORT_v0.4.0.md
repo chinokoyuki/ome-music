@@ -65,7 +65,7 @@ Cover A-B-A/重启、库行封面稳定、QR 轮询生命周期、登录门控�
 
 1. qqmusic.rs 部分 `eprintln!` 未用 debug_assertions 门控（内容仅计数/状态码，无凭据）。
 2. PR 分支历史含 3 个 "Merge branch 'zerolyx:main' into main" 提交（历史噪声，禁止改写）。
-3. NetEase cookie 明文镜像文件（base64，PersonalConfig/netease_session.local）：设计如此（keyring 读取失败兜底），文档已注明。
+3. NetEase cookie 明文镜像文件（base64，PersonalConfig/netease_session.local）：设计如此（keyring 读取瞬时失败兜底，logout 双清）。2026-09-07 轮复核：Bilibili/QQ 均为 keyring-only，仅 NetEase 有此镜像；定级 P1 安全加固项，已在 SECURITY.md 完整记录（含 keyring-primary + DPAPI 迁移方案，目标 v0.4.1）。**修正：上一轮"文档已注明"的说法当时不实——SECURITY.md 原先并无记载，本轮已补。**
 
 ---
 
@@ -88,6 +88,7 @@ Cover A-B-A/重启、库行封面稳定、QR 轮询生命周期、登录门控�
 4. **Lyrics 多预设/Playwright 视觉回归/30 分钟 soak/大队列 1000+ 实测**：需交互式或真实环境，本会话无 GUI 执行条件 → 人工 QA 清单（H）。
 5. **版本 bump 0.4.0 / tag**：发布动作，须在干净 main 上由维护者在 QA 后执行（本轮结论 I/J 路径）。
 6. **Cargo.toml 行尾伪差异**：内容一致，已恢复，无需处理。
+7. **NetEase 明文会话镜像（P1）**：keyring 读写瞬时失败的兜底是真实 P0 修复的产物，冻结期内改凭据写路径有登录回归风险；已完整记录于 SECURITY.md，迁移方案（keyring-primary + DPAPI + 遗留文件清理）定于 v0.4.1。Bilibili/QQ 已是 keyring-only，无需处理。
 
 ---
 
